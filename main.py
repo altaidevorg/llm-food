@@ -1,12 +1,19 @@
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Query
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    BackgroundTasks,
+    HTTPException,
+    Query,
+    Depends,
+)
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import List, Literal, Union
+from typing import List, Union, Optional
 import uuid
 import os
-import shutil
 import hashlib
 import httpx
-import time  # Keep for now, for placeholder task simulation if GCS fails
 
 # Imports for GCS
 from google.cloud import storage
@@ -22,6 +29,41 @@ from pptx import Presentation
 import trafilatura
 
 app = FastAPI()
+
+# --- Security ---
+bearer_scheme = HTTPBearer(
+    auto_error=False
+)  # auto_error=False to handle optional token & custom errors
+
+
+def get_api_auth_token() -> Optional[str]:
+    return os.getenv("API_AUTH_TOKEN")
+
+
+async def authenticate_request(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+) -> None:
+    configured_token = get_api_auth_token()
+    if configured_token:  # Only enforce auth if a token is configured server-side
+        if credentials is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Not authenticated. Authorization header is missing.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if credentials.scheme != "Bearer":
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid authentication scheme. Only Bearer is supported.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if credentials.token != configured_token:
+            raise HTTPException(
+                status_code=403,
+                detail="Invalid token.",
+            )
+    # If no token is configured server-side, or if authentication passes, do nothing.
+    return
 
 
 # --- Configuration ---
@@ -39,6 +81,22 @@ def get_gcs_credentials():
     if credentials_path:
         return service_account.Credentials.from_service_account_file(credentials_path)
     return None  # Fallback to default environment auth if not set
+
+
+def get_max_file_size_bytes() -> Union[int, None]:
+    max_size_mb_str = os.getenv("MAX_FILE_SIZE_MB")
+    if max_size_mb_str:
+        try:
+            max_size_mb = int(max_size_mb_str)
+            if max_size_mb > 0:
+                return max_size_mb * 1024 * 1024  # Convert MB to Bytes
+            else:
+                # Log this invalid configuration? For now, treat as no limit.
+                pass
+        except ValueError:
+            # Log this invalid configuration? For now, treat as no limit.
+            pass
+    return None  # No limit or invalid value treated as no limit
 
 
 SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".rtf", ".pptx", ".html", ".htm"]
@@ -116,10 +174,21 @@ def _process_file_content(
     return texts_list
 
 
-@app.post("/convert", response_model=ConversionResponse)
+@app.post(
+    "/convert",
+    response_model=ConversionResponse,
+    dependencies=[Depends(authenticate_request)],
+)
 async def convert_file_upload(file: UploadFile = File(...)):
     ext = os.path.splitext(file.filename)[1].lower()
     content = await file.read()
+
+    max_size = get_max_file_size_bytes()
+    if max_size is not None and len(content) > max_size:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File size {len(content) / (1024 * 1024):.2f}MB exceeds maximum allowed size of {max_size / (1024 * 1024):.2f}MB.",
+        )
 
     content_hash = hashlib.sha256(content).hexdigest()
     pdf_backend_choice = get_pdf_backend()
@@ -138,7 +207,11 @@ async def convert_file_upload(file: UploadFile = File(...)):
     )
 
 
-@app.get("/convert", response_model=ConversionResponse)
+@app.get(
+    "/convert",
+    response_model=ConversionResponse,
+    dependencies=[Depends(authenticate_request)],
+)
 async def convert_url(
     url: str = Query(..., description="URL of the webpage to convert to Markdown"),
 ):
@@ -171,12 +244,12 @@ async def convert_url(
     )
 
 
-@app.get("/status/{task_id}")
+@app.get("/status/{task_id}", dependencies=[Depends(authenticate_request)])
 def status(task_id: str):
     return TASKS.get(task_id, {"status": "not_found"})
 
 
-@app.post("/batch")
+@app.post("/batch", dependencies=[Depends(authenticate_request)])
 def batch(request: BatchRequest, background_tasks: BackgroundTasks):
     task_id = str(uuid.uuid4())
     TASKS[task_id] = {

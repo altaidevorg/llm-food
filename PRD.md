@@ -66,7 +66,7 @@ A FastAPI-based microservice to convert supported input formats (PDF, DOC/DOCX, 
 | ---------------- | ---------------------------------------- |
 | `pdf_backend`    | `'pymupdf4llm'` (default) or `'pypdf2'`  |
 | `max_file_size`  | Optional size cap in MB                  |
-| `gcs_project_id` | GCP Project ID for bucket access         |
+| `GOOGLE_CLOUD_PROJECT` | GCP Project ID for bucket access         |
 | `auth_token`     | Optional Bearer token for endpoint usage |
 
 ---
@@ -92,88 +92,3 @@ A FastAPI-based microservice to convert supported input formats (PDF, DOC/DOCX, 
 * OCR fallback for scanned PDFs (`tesserocr` or `pytesseract`)
 * Language detection
 * Basic metadata extraction
-
-## Starter code
-
-```python
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
-from pydantic import BaseModel
-from typing import List, Literal
-import uuid, os
-import shutil
-
-app = FastAPI()
-
-# Config placeholder
-def get_pdf_backend():
-    return os.getenv("PDF_BACKEND", "pymupdf4llm")
-
-class BatchRequest(BaseModel):
-    input_gcs_path: str
-    output_gcs_path: str
-
-# Placeholder for task store
-TASKS = {}
-
-@app.post("/convert")
-async def convert(file: UploadFile = File(...)):
-    ext = os.path.splitext(file.filename)[1].lower()
-    content = await file.read()
-    
-    if ext == ".pdf":
-        backend = get_pdf_backend()
-        if backend == "pymupdf4llm":
-            from pymupdf4llm import to_markdown
-            text = to_markdown(content)
-        elif backend == "pypdf2":
-            from PyPDF2 import PdfReader
-            from io import BytesIO
-            reader = PdfReader(BytesIO(content))
-            text = "\n".join(p.extract_text() or "" for p in reader.pages)
-        else:
-            raise HTTPException(400, "Invalid PDF backend")
-
-    elif ext in [".docx"]:
-        from docx import Document
-        from io import BytesIO
-        doc = Document(BytesIO(content))
-        text = "\n".join(p.text for p in doc.paragraphs)
-
-    elif ext in [".rtf"]:
-        from striprtf.striprtf import rtf_to_text
-        text = rtf_to_text(content.decode("utf-8"))
-
-    elif ext in [".pptx"]:
-        from pptx import Presentation
-        from io import BytesIO
-        prs = Presentation(BytesIO(content))
-        text = "\n".join([shape.text for slide in prs.slides for shape in slide.shapes if hasattr(shape, "text")])
-
-    elif ext in [".html", ".htm"]:
-        import prafilatura
-        text = prafilatura.extract(content.decode("utf-8"))
-
-    else:
-        raise HTTPException(400, "Unsupported file type")
-
-    return {"markdown": text}
-
-@app.post("/batch")
-def batch(request: BatchRequest, background_tasks: BackgroundTasks):
-    task_id = str(uuid.uuid4())
-    TASKS[task_id] = {"status": "pending"}
-    background_tasks.add_task(run_batch_task, request.input_gcs_path, request.output_gcs_path, task_id)
-    return {"task_id": task_id}
-
-@app.get("/status/{task_id}")
-def status(task_id: str):
-    return TASKS.get(task_id, {"status": "not_found"})
-
-# Dummy runner for async task
-def run_batch_task(input_path, output_path, task_id):
-    import time
-    TASKS[task_id] = {"status": "running"}
-    time.sleep(2)  # simulate work
-    # logic for pulling from GCS, converting, and saving goes here
-    TASKS[task_id] = {"status": "done"}
-```

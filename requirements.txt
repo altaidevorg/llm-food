@@ -9,3 +9,4 @@ pymupdf4llm
 pypdf
 google-cloud-storage
 httpx
+python-multipart
