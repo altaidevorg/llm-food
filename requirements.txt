@@ -1,8 +1,11 @@
 fastapi
 uvicorn
+pydantic
+python-docx
+striprtf
+python-pptx
 trafilatura
 pymupdf4llm
-pypdf2
-python-docx
-python-pptx
+pypdf
 google-cloud-storage
+httpx
