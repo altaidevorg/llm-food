@@ -2,6 +2,8 @@
 
 *Serving files for hungry LLMs*
 
+![LOGO](./assets//logo.png)
+
 ---
 
 ## Overview
