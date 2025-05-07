@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+trafilatura
+pymupdf4llm
+pypdf2
+python-docx
+python-pptx
+google-cloud-storage
