@@ -68,7 +68,7 @@ async def authenticate_request(
 
 # --- Configuration ---
 def get_pdf_backend():
-    return os.getenv("PDF_BACKEND", "pymupdf4llm")
+    return os.getenv("PDF_BACKEND", "pypdf2")
 
 
 def get_gcs_project_id():

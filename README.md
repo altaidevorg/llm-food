@@ -15,7 +15,7 @@ The service supports synchronous single file processing, asynchronous batch proc
 ## Features
 
 * **Multiple Format Support:** Convert PDF, DOC/DOCX, RTF, PPTX, and HTML/webpages to Markdown.
-* **Flexible PDF Backend:** Choose between `pymupdf4llm` (default, AGPL) and `pypdf2` (for commercial-friendly use) for PDF extraction.
+* **Flexible PDF Backend:** Choose between `pypdf2` (default for commercial-friendly use) and `pymupdf4llm` (AGPL, but usually better quality) for PDF extraction.
 * **Synchronous Conversion:** Upload a single file and receive its Markdown content directly.
 * **URL Conversion:** Provide a URL and get its main content as Markdown.
 * **Asynchronous Batch Processing:** Process multiple files from a Google Cloud Storage (GCS) bucket and save Markdown outputs to another GCS location.
@@ -176,7 +176,7 @@ If the token is not set in the environment, the API will be accessible without a
 
 ## License Considerations
 
-Note that `pymupdf4llm`, the default PDF extraction backend, is licensed under AGPL. If this is a concern for your use case, you can switch to the `pypdf2` backend (which uses the `pypdf` library, typically under a more permissive license like MIT or BSD) by setting the `PDF_BACKEND=pypdf2` environment variable.
+Note that `pymupdf4llm` is licensed under AGPL. If this is not a concern for your use case or if you have a commercial license, you can switch from the default `pypdf2` backend (which uses the `pypdf` library, typically under a more permissive license like MIT or BSD) to `PyMuPDF4LLM` by setting the `PDF_BACKEND=pymupdf4llm` environment variable.
 
 ## Future Enhancements (Stretch Goals from PRD)
 
