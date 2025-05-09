@@ -128,11 +128,57 @@ class BatchRequest(BaseModel):
 TASKS = {}
 
 
+def _process_docx_sync(content_bytes: bytes) -> List[str]:
+    try:
+        doc = BytesIO(content_bytes)
+        doc_html = mammoth.convert_to_html(doc).value
+        doc_md = markdownify(doc_html).strip()
+        return [doc_md]
+    except Exception as e:
+        return [f"Error processing DOCX: {str(e)}"]
+
+
+def _process_rtf_sync(content_bytes: bytes) -> List[str]:
+    try:
+        return [rtf_to_text(content_bytes.decode("utf-8", errors="ignore"))]
+    except Exception as e:
+        return [f"Error processing RTF: {str(e)}"]
+
+
+def _process_pptx_sync(content_bytes: bytes) -> List[str]:
+    try:
+        prs = Presentation(BytesIO(content_bytes))
+        # Corrected list comprehension for PPTX to build a single string per slide, then list of slide texts
+        slide_texts = []
+        for slide in prs.slides:
+            text_on_slide = "\n".join(
+                shape.text
+                for shape in slide.shapes
+                if hasattr(shape, "text") and shape.text
+            )
+            if text_on_slide:  # Only add if there's text
+                slide_texts.append(text_on_slide)
+        return (
+            slide_texts if slide_texts else [""]
+        )  # Return list of slide texts, or list with empty string if no text
+    except Exception as e:
+        return [f"Error processing PPTX: {str(e)}"]
+
+
+def _process_html_sync(content_bytes: bytes) -> List[str]:
+    try:
+        extracted_text = trafilatura.extract(
+            content_bytes.decode("utf-8", errors="ignore"), output_format="markdown"
+        )
+        return [extracted_text if extracted_text is not None else ""]
+    except Exception as e:
+        return [f"Error processing HTML: {str(e)}"]
+
+
 async def _process_file_content(
     ext: str, content: bytes, pdf_backend_choice: str
 ) -> List[str]:
     texts_list: List[str] = []
-    print("pdf backend is", pdf_backend_choice)
     if ext == ".pdf":
         if pdf_backend_choice == "pymupdf4llm":
             try:
@@ -148,7 +194,6 @@ async def _process_file_content(
             except Exception as e:
                 texts_list = [f"Error processing PDF with pypdf: {str(e)}"]
         elif pdf_backend_choice == "gemini":
-            print("it hit gemini backend correctly")
             pages = convert_from_bytes(content)
             images_b64 = []
             for page in pages:
@@ -177,43 +222,15 @@ async def _process_file_content(
             )
             texts_list = [result.text for result in results]
         else:
-            print("it shouldn't hit here")
             texts_list = ["Invalid PDF backend specified."]
     elif ext in [".docx"]:
-        try:
-            doc = BytesIO(content)
-            doc_html = mammoth.convert_to_html(doc).value
-            doc_md = markdownify(doc_html).strip()
-            texts_list = [doc_md]
-        except Exception as e:
-            texts_list = [f"Error processing DOCX: {str(e)}"]
+        texts_list = await asyncio.to_thread(_process_docx_sync, content)
     elif ext in [".rtf"]:
-        try:
-            texts_list = [rtf_to_text(content.decode("utf-8", errors="ignore"))]
-        except Exception as e:
-            texts_list = [f"Error processing RTF: {str(e)}"]
+        texts_list = await asyncio.to_thread(_process_rtf_sync, content)
     elif ext in [".pptx"]:
-        try:
-            prs = Presentation(BytesIO(content))
-            texts_list = [
-                "\n".join(
-                    shape.text
-                    for slide in prs.slides
-                    for shape in slide.shapes
-                    if hasattr(shape, "text") and shape.text
-                )
-                for slide in prs.slides
-            ]
-        except Exception as e:
-            texts_list = [f"Error processing PPTX: {str(e)}"]
+        texts_list = await asyncio.to_thread(_process_pptx_sync, content)
     elif ext in [".html", ".htm"]:
-        try:
-            extracted_text = trafilatura.extract(
-                content.decode("utf-8", errors="ignore"), output_format="markdown"
-            )
-            texts_list = [extracted_text if extracted_text is not None else ""]
-        except Exception as e:
-            texts_list = [f"Error processing HTML: {str(e)}"]
+        texts_list = await asyncio.to_thread(_process_html_sync, content)
     else:
         texts_list = ["Unsupported file type encountered in _process_file_content."]
     return texts_list
