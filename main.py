@@ -43,6 +43,11 @@ match get_pdf_backend():
     case "gemini":
         from pdf2image import convert_from_bytes
         from google import genai
+        from google.genai.types import CreateBatchJobConfig, JobState, HttpOptions
+
+        prompt = """OCR this document to Markdown with text formatting such as bold, italic, headings, tables, numbered and bulleted lists properly rendered in Markdown Do not suround the out with Markdown fences. Preserve as much content as possible, such as headings, tables, lists. etc. Do not add any preamble or additional explanation of any other kind --simply output the well-formatted text output in Markdown."""
+    case invalid_backend:
+        raise ValueError(f"Invalid PDF backend: {invalid_backend}")
 
 app = FastAPI()
 
@@ -93,6 +98,16 @@ def get_gcs_credentials():
     if credentials_path:
         return service_account.Credentials.from_service_account_file(credentials_path)
     return None  # Fallback to default environment auth if not set
+
+
+def get_gemini_client():
+    project = get_gcs_project_id()
+    location = "us-central1"
+    api_key = os.getenv("ALTAI_GEMINI_API_KEY")
+    client = (
+        genai.Client(vertexai=False, api_key=api_key) if api_key else genai.Client()
+    )
+    return client
 
 
 def get_max_file_size_bytes() -> Union[int, None]:
@@ -175,24 +190,32 @@ def _process_html_sync(content_bytes: bytes) -> List[str]:
         return [f"Error processing HTML: {str(e)}"]
 
 
+def _process_pdf_pymupdf4llm_sync(content_bytes: bytes) -> List[str]:
+    try:
+        pymupdf_doc = pymupdf.Document(stream=content_bytes, filetype="pdf")
+        page_data_list = to_markdown(pymupdf_doc, page_chunks=True)
+        return [page_dict.get("text", "") for page_dict in page_data_list]
+    except Exception as e:
+        return [f"Error processing PDF with pymupdf4llm: {str(e)}"]
+
+
+def _process_pdf_pypdf2_sync(content_bytes: bytes) -> List[str]:
+    try:
+        reader = PdfReader(BytesIO(content_bytes))
+        return [p.extract_text() or "" for p in reader.pages]
+    except Exception as e:
+        return [f"Error processing PDF with pypdf: {str(e)}"]
+
+
 async def _process_file_content(
     ext: str, content: bytes, pdf_backend_choice: str
 ) -> List[str]:
     texts_list: List[str] = []
     if ext == ".pdf":
         if pdf_backend_choice == "pymupdf4llm":
-            try:
-                pymupdf_doc = pymupdf.Document(stream=content, filetype="pdf")
-                page_data_list = to_markdown(pymupdf_doc, page_chunks=True)
-                texts_list = [page_dict.get("text", "") for page_dict in page_data_list]
-            except Exception as e:
-                texts_list = [f"Error processing PDF with pymupdf4llm: {str(e)}"]
+            texts_list = await asyncio.to_thread(_process_pdf_pymupdf4llm_sync, content)
         elif pdf_backend_choice == "pypdf2":
-            try:
-                reader = PdfReader(BytesIO(content))
-                texts_list = [p.extract_text() or "" for p in reader.pages]
-            except Exception as e:
-                texts_list = [f"Error processing PDF with pypdf: {str(e)}"]
+            texts_list = await asyncio.to_thread(_process_pdf_pypdf2_sync, content)
         elif pdf_backend_choice == "gemini":
             pages = convert_from_bytes(content)
             images_b64 = []
@@ -202,13 +225,11 @@ async def _process_file_content(
                 image_data = buffer.getvalue()
                 b64_str = base64.b64encode(image_data).decode("utf-8")
                 images_b64.append(b64_str)
-            client = genai.Client(
-                vertexai=False, api_key=os.environ["ALTAI_GEMINI_API_KEY"]
-            )
+            client = get_gemini_client()
             payloads = [
                 [
                     {"inline_data": {"data": b64_str, "mime_type": "image/png"}},
-                    {"text": "OCR this image to Markdown"},
+                    {"text": prompt},
                 ]
                 for b64_str in images_b64
             ]
