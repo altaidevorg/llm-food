@@ -9,24 +9,45 @@ from fastapi import (
 )
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
+import asyncio
+import base64
 from typing import List, Union, Optional
 import uuid
 import os
 import hashlib
 import httpx
+import mammoth
 
 # Imports for GCS
 from google.cloud import storage
 from google.oauth2 import service_account  # For local testing with service account
+from markdownify import markdownify
 
 from io import BytesIO
-from pymupdf4llm import to_markdown
-import pymupdf
-from pypdf import PdfReader
-from docx import Document
 from striprtf.striprtf import rtf_to_text
 from pptx import Presentation
 import trafilatura
+
+
+# --- Conditional imports based on the PDF backend ---
+def get_pdf_backend():
+    return os.getenv("PDF_BACKEND", "gemini")
+
+
+match get_pdf_backend():
+    case "pymupdf4llm":
+        from pymupdf4llm import to_markdown
+        import pymupdf
+    case "pypdf2":
+        from pypdf import PdfReader
+    case "gemini":
+        from pdf2image import convert_from_bytes
+        from google import genai
+        from google.genai.types import CreateBatchJobConfig, JobState, HttpOptions
+
+        prompt = """OCR this document to Markdown with text formatting such as bold, italic, headings, tables, numbered and bulleted lists properly rendered in Markdown Do not suround the out with Markdown fences. Preserve as much content as possible, such as headings, tables, lists. etc. Do not add any preamble or additional explanation of any other kind --simply output the well-formatted text output in Markdown."""
+    case invalid_backend:
+        raise ValueError(f"Invalid PDF backend: {invalid_backend}")
 
 app = FastAPI()
 
@@ -66,11 +87,7 @@ async def authenticate_request(
     return
 
 
-# --- Configuration ---
-def get_pdf_backend():
-    return os.getenv("PDF_BACKEND", "pypdf2")
-
-
+# other configuration
 def get_gcs_project_id():
     return os.getenv("GOOGLE_CLOUD_PROJECT")
 
@@ -81,6 +98,16 @@ def get_gcs_credentials():
     if credentials_path:
         return service_account.Credentials.from_service_account_file(credentials_path)
     return None  # Fallback to default environment auth if not set
+
+
+def get_gemini_client():
+    project = get_gcs_project_id()
+    location = "us-central1"
+    api_key = os.getenv("ALTAI_GEMINI_API_KEY")
+    client = (
+        genai.Client(vertexai=False, api_key=api_key) if api_key else genai.Client()
+    )
+    return client
 
 
 def get_max_file_size_bytes() -> Union[int, None]:
@@ -116,59 +143,115 @@ class BatchRequest(BaseModel):
 TASKS = {}
 
 
-def _process_file_content(
+def _process_docx_sync(content_bytes: bytes) -> List[str]:
+    try:
+        doc = BytesIO(content_bytes)
+        doc_html = mammoth.convert_to_html(doc).value
+        doc_md = markdownify(doc_html).strip()
+        return [doc_md]
+    except Exception as e:
+        return [f"Error processing DOCX: {str(e)}"]
+
+
+def _process_rtf_sync(content_bytes: bytes) -> List[str]:
+    try:
+        return [rtf_to_text(content_bytes.decode("utf-8", errors="ignore"))]
+    except Exception as e:
+        return [f"Error processing RTF: {str(e)}"]
+
+
+def _process_pptx_sync(content_bytes: bytes) -> List[str]:
+    try:
+        prs = Presentation(BytesIO(content_bytes))
+        # Corrected list comprehension for PPTX to build a single string per slide, then list of slide texts
+        slide_texts = []
+        for slide in prs.slides:
+            text_on_slide = "\n".join(
+                shape.text
+                for shape in slide.shapes
+                if hasattr(shape, "text") and shape.text
+            )
+            if text_on_slide:  # Only add if there's text
+                slide_texts.append(text_on_slide)
+        return (
+            slide_texts if slide_texts else [""]
+        )  # Return list of slide texts, or list with empty string if no text
+    except Exception as e:
+        return [f"Error processing PPTX: {str(e)}"]
+
+
+def _process_html_sync(content_bytes: bytes) -> List[str]:
+    try:
+        extracted_text = trafilatura.extract(
+            content_bytes.decode("utf-8", errors="ignore"), output_format="markdown"
+        )
+        return [extracted_text if extracted_text is not None else ""]
+    except Exception as e:
+        return [f"Error processing HTML: {str(e)}"]
+
+
+def _process_pdf_pymupdf4llm_sync(content_bytes: bytes) -> List[str]:
+    try:
+        pymupdf_doc = pymupdf.Document(stream=content_bytes, filetype="pdf")
+        page_data_list = to_markdown(pymupdf_doc, page_chunks=True)
+        return [page_dict.get("text", "") for page_dict in page_data_list]
+    except Exception as e:
+        return [f"Error processing PDF with pymupdf4llm: {str(e)}"]
+
+
+def _process_pdf_pypdf2_sync(content_bytes: bytes) -> List[str]:
+    try:
+        reader = PdfReader(BytesIO(content_bytes))
+        return [p.extract_text() or "" for p in reader.pages]
+    except Exception as e:
+        return [f"Error processing PDF with pypdf: {str(e)}"]
+
+
+async def _process_file_content(
     ext: str, content: bytes, pdf_backend_choice: str
 ) -> List[str]:
     texts_list: List[str] = []
     if ext == ".pdf":
         if pdf_backend_choice == "pymupdf4llm":
-            try:
-                pymupdf_doc = pymupdf.Document(stream=content, filetype="pdf")
-                page_data_list = to_markdown(pymupdf_doc, page_chunks=True)
-                texts_list = [page_dict.get("text", "") for page_dict in page_data_list]
-            except Exception as e:
-                texts_list = [f"Error processing PDF with pymupdf4llm: {str(e)}"]
+            texts_list = await asyncio.to_thread(_process_pdf_pymupdf4llm_sync, content)
         elif pdf_backend_choice == "pypdf2":
-            try:
-                reader = PdfReader(BytesIO(content))
-                texts_list = [p.extract_text() or "" for p in reader.pages]
-            except Exception as e:
-                texts_list = [f"Error processing PDF with pypdf: {str(e)}"]
+            texts_list = await asyncio.to_thread(_process_pdf_pypdf2_sync, content)
+        elif pdf_backend_choice == "gemini":
+            pages = convert_from_bytes(content)
+            images_b64 = []
+            for page in pages:
+                buffer = BytesIO()
+                page.save(buffer, format="PNG")
+                image_data = buffer.getvalue()
+                b64_str = base64.b64encode(image_data).decode("utf-8")
+                images_b64.append(b64_str)
+            client = get_gemini_client()
+            payloads = [
+                [
+                    {"inline_data": {"data": b64_str, "mime_type": "image/png"}},
+                    {"text": prompt},
+                ]
+                for b64_str in images_b64
+            ]
+            results = await asyncio.gather(
+                *[
+                    client.aio.models.generate_content(
+                        model="gemini-2.0-flash", contents=payload
+                    )
+                    for payload in payloads
+                ]
+            )
+            texts_list = [result.text for result in results]
         else:
             texts_list = ["Invalid PDF backend specified."]
     elif ext in [".docx"]:
-        try:
-            doc = Document(BytesIO(content))
-            texts_list = ["\n".join(p.text for p in doc.paragraphs)]
-        except Exception as e:
-            texts_list = [f"Error processing DOCX: {str(e)}"]
+        texts_list = await asyncio.to_thread(_process_docx_sync, content)
     elif ext in [".rtf"]:
-        try:
-            texts_list = [rtf_to_text(content.decode("utf-8", errors="ignore"))]
-        except Exception as e:
-            texts_list = [f"Error processing RTF: {str(e)}"]
+        texts_list = await asyncio.to_thread(_process_rtf_sync, content)
     elif ext in [".pptx"]:
-        try:
-            prs = Presentation(BytesIO(content))
-            texts_list = [
-                "\n".join(
-                    shape.text
-                    for slide in prs.slides
-                    for shape in slide.shapes
-                    if hasattr(shape, "text") and shape.text
-                )
-                for slide in prs.slides
-            ]
-        except Exception as e:
-            texts_list = [f"Error processing PPTX: {str(e)}"]
+        texts_list = await asyncio.to_thread(_process_pptx_sync, content)
     elif ext in [".html", ".htm"]:
-        try:
-            extracted_text = trafilatura.extract(
-                content.decode("utf-8", errors="ignore"), output_format="markdown"
-            )
-            texts_list = [extracted_text if extracted_text is not None else ""]
-        except Exception as e:
-            texts_list = [f"Error processing HTML: {str(e)}"]
+        texts_list = await asyncio.to_thread(_process_html_sync, content)
     else:
         texts_list = ["Unsupported file type encountered in _process_file_content."]
     return texts_list
@@ -193,7 +276,7 @@ async def convert_file_upload(file: UploadFile = File(...)):
     content_hash = hashlib.sha256(content).hexdigest()
     pdf_backend_choice = get_pdf_backend()
 
-    texts_list = _process_file_content(ext, content, pdf_backend_choice)
+    texts_list = await _process_file_content(ext, content, pdf_backend_choice)
 
     if texts_list and (
         texts_list[0].startswith("Error processing")
@@ -265,7 +348,7 @@ def batch(request: BatchRequest, background_tasks: BackgroundTasks):
 
 
 # Actual batch processing logic
-def run_batch_task(
+async def run_batch_task(
     input_paths: Union[str, List[str]], output_gcs_path_str: str, task_id: str
 ):
     TASKS[task_id]["status"] = "initializing"
@@ -344,7 +427,7 @@ def run_batch_task(
 
                 file_ext = os.path.splitext(blob_name)[1].lower()
 
-                markdown_texts = _process_file_content(
+                markdown_texts = await _process_file_content(
                     file_ext, file_content_bytes, pdf_backend_choice
                 )
 

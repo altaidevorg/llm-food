@@ -1,7 +1,8 @@
 fastapi
 uvicorn
 pydantic
-python-docx
+markdownify
+mammoth
 striprtf
 python-pptx
 trafilatura
@@ -10,3 +11,4 @@ pypdf
 google-cloud-storage
 httpx
 python-multipart
+pdf2image
