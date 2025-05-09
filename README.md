@@ -11,11 +11,12 @@
 `llm-food` is a FastAPI-based microservice designed to convert various input document formats into clean Markdown text. This output is optimized for downstream Large Language Model (LLM) pipelines, such as those used for Retrieval Augmented Generation (RAG) or fine-tuning.
 
 The service supports synchronous single file processing, asynchronous batch processing via Google Cloud Storage (GCS), and direct URL-to-Markdown conversion.
+All conversion tasks are handled asynchronously to ensure server responsiveness.
 
 ## Features
 
 * **Multiple Format Support:** Convert PDF, DOC/DOCX, RTF, PPTX, and HTML/webpages to Markdown.
-* **Flexible PDF Backend:** Choose between `pypdf2` (default for commercial-friendly use) and `pymupdf4llm` (AGPL, but usually better quality) for PDF extraction.
+* **Advanced PDF Processing:** Utilizes Google's Gemini model by default for high-quality OCR and Markdown conversion of PDFs. Alternative backends (`pymupdf4llm`, `pypdf2`) are also available.
 * **Synchronous Conversion:** Upload a single file and receive its Markdown content directly.
 * **URL Conversion:** Provide a URL and get its main content as Markdown.
 * **Asynchronous Batch Processing:** Process multiple files from a Google Cloud Storage (GCS) bucket and save Markdown outputs to another GCS location.
@@ -27,7 +28,7 @@ The service supports synchronous single file processing, asynchronous batch proc
 
 | Format    | Extractor Library Used                      |
 | :-------- | :------------------------------------------ |
-| PDF       | `pymupdf4llm` (default) / `pypdf`           |
+| PDF       | `google-generativeai` (Gemini - default) / `pymupdf4llm` / `pypdf` |
 | DOC/DOCX  | `python-docx`                               |
 | RTF       | `striprtf`                                  |
 | PPTX      | `python-pptx`                               |
@@ -58,8 +59,8 @@ The service is configured using environment variables. Create a `.env` file in t
 ```env
 # .env.sample content:
 
-# Backend for PDF processing: 'pymupdf4llm' (default) or 'pypdf2'
-PDF_BACKEND=pymupdf4llm
+# Backend for PDF processing: 'gemini' (default), 'pymupdf4llm', or 'pypdf2'
+PDF_BACKEND=gemini
 
 # Google Cloud Project ID (Required for GCS batch operations if not running in GCP with default creds)
 GOOGLE_CLOUD_PROJECT=
@@ -75,15 +76,23 @@ MAX_FILE_SIZE_MB=
 # API Authentication Bearer Token (Optional. If set, all endpoints will require this token)
 # Example: API_AUTH_TOKEN=your-secret-bearer-token
 API_AUTH_TOKEN=
+
+# Gemini API Key (Required for 'gemini' PDF_BACKEND if not using Application Default Credentials)
+# Example: ALTAI_GEMINI_API_KEY=your-gemini-api-key
+ALTAI_GEMINI_API_KEY=
 ```
 
 **Key Variables:**
 
-* `PDF_BACKEND`: Choose PDF processing library. `pypdf2` (via `pypdf` package) is recommended if AGPL license of `pymupdf4llm` is a concern.
-* `GOOGLE_CLOUD_PROJECT`: Your GCP Project ID, necessary for batch GCS operations.
-* `GOOGLE_APPLICATION_CREDENTIALS`: Path to your service account key file for local GCS access.
+* `PDF_BACKEND`: Choose the PDF processing backend.
+  * `gemini` (default): Uses Google's Gemini model for advanced OCR and Markdown conversion. Requires `ALTAI_GEMINI_API_KEY` or appropriate Application Default Credentials.
+  * `pymupdf4llm`: Uses the PyMuPDF library (AGPLv3 licensed). Often provides good quality extraction.
+  * `pypdf2`: Uses the `pypdf` library (typically MIT/BSD licensed). A good option if AGPL is a concern and Gemini is not used.
+* `GOOGLE_CLOUD_PROJECT`: Your GCP Project ID, necessary for batch GCS operations and potentially for Gemini if using Vertex AI authentication.
+* `GOOGLE_APPLICATION_CREDENTIALS`: Path to your service account key file for local GCS access and can also be used by Gemini if `ALTAI_GEMINI_API_KEY` is not set and ADC are configured via this file.
 * `MAX_FILE_SIZE_MB`: Optional limit for uploaded file sizes in the synchronous `/convert` endpoint.
 * `API_AUTH_TOKEN`: If set, all API endpoints will require this token in the `Authorization: Bearer <token>` header.
+* `ALTAI_GEMINI_API_KEY`: Your API key for Google Gemini. If this is set, it will be used for the `gemini` PDF backend. If not set and `PDF_BACKEND="gemini"`, the service will attempt to use Application Default Credentials (e.g., when running in a GCP environment or if `gcloud auth application-default login` has been run).
 
 ## Setup and Running
 
@@ -176,11 +185,16 @@ If the token is not set in the environment, the API will be accessible without a
 
 ## License Considerations
 
-Note that `pymupdf4llm` is licensed under AGPL. If this is not a concern for your use case or if you have a commercial license, you can switch from the default `pypdf2` backend (which uses the `pypdf` library, typically under a more permissive license like MIT or BSD) to `PyMuPDF4LLM` by setting the `PDF_BACKEND=pymupdf4llm` environment variable.
+The default PDF processing backend is `gemini`, which uses Google's Generative AI SDK. Please review Google's terms of service for Gemini.
+Alternative PDF backends are available:
 
-## Future Enhancements (Stretch Goals from PRD)
+* `pymupdf4llm`: This library is licensed under AGPLv3. Ensure compliance if you choose to use this backend.
+* `pypdf2`: This library (via `pypdf`) typically uses more permissive licenses like MIT or BSD.
 
-* Gemini backend for PDFs
-* OCR fallback for scanned PDFs (e.g., using `tesserocr` or `pytesseract`).
+## Future Enhancements
+
+* Support Batch Prediction with Gemini for cost-friendly inference
+* Integrate Duckdb for task tracking and caching
+* Advanced OCR capabilities are now primarily handled by the Gemini backend. Alternative OCR solutions (e.g., `tesserocr`, `pytesseract`) could be considered for non-Gemini PDF backends or offline support.
 * Language detection.
 * More metadata extraction from documents.
