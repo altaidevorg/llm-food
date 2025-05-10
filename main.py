@@ -141,6 +141,29 @@ class BatchRequest(BaseModel):
     output_path: str
 
 
+# Pydantic models for GET /batch/{task_id} response
+class BatchOutputItem(BaseModel):
+    original_filename: str
+    markdown_content: str
+    gcs_output_uri: str
+
+
+class BatchJobFailedFileOutput(BaseModel):
+    original_filename: str
+    file_type: str
+    page_number: Optional[int] = None
+    error_message: Optional[str] = None
+    status: str
+
+
+class BatchJobOutputResponse(BaseModel):
+    job_id: str
+    status: str
+    outputs: List[BatchOutputItem] = []
+    errors: List[BatchJobFailedFileOutput] = []
+    message: Optional[str] = None
+
+
 TASKS = {}
 
 
@@ -586,7 +609,126 @@ async def batch_files_upload(
     return {"task_id": main_batch_job_id}
 
 
-# Placeholder for the new helper functions - to be implemented next
+@app.get(
+    "/batch/{task_id}",
+    response_model=BatchJobOutputResponse,
+    dependencies=[Depends(authenticate_request)],
+)
+async def get_batch_output(task_id: str):
+    con = get_db_connection()
+    try:
+        job_details_tuple = con.execute(
+            "SELECT job_id, status, output_gcs_path FROM batch_jobs WHERE job_id = ?",
+            (task_id,),
+        ).fetchone()
+        if not job_details_tuple:
+            raise HTTPException(
+                status_code=404, detail=f"Batch job {task_id} not found."
+            )
+
+        job_id, job_status, output_gcs_path = job_details_tuple
+
+        outputs_list = []
+        errors_list = []
+        message = None
+
+        completed_statuses_for_output = ["completed", "completed_with_errors"]
+
+        if job_status in completed_statuses_for_output:
+            # Fetch distinct successful outputs
+            # A file is considered successfully processed if at least one of its file_tasks (e.g. a page for a PDF, or the file itself for docx)
+            # has a gcs_output_markdown_uri and status completed.
+            # We need the original_filename and the gcs_output_markdown_uri of the *final aggregated file*.
+            # The current DB schema stores the aggregated URI in each page's file_task if that page was part of a successful aggregate.
+            successful_files_query = """
+                SELECT DISTINCT original_filename, gcs_output_markdown_uri 
+                FROM file_tasks 
+                WHERE batch_job_id = ? AND status = 'completed' AND gcs_output_markdown_uri IS NOT NULL
+            """
+            successful_file_uris_tuples = con.execute(
+                successful_files_query, (task_id,)
+            ).fetchall()
+
+            if successful_file_uris_tuples:
+                storage_client = storage.Client(
+                    project=get_gcs_project_id(), credentials=get_gcs_credentials()
+                )
+                for original_fn, gcs_uri in successful_file_uris_tuples:
+                    try:
+                        bucket_name, blob_name = gcs_uri.replace("gs://", "").split(
+                            "/", 1
+                        )
+                        bucket = storage_client.bucket(bucket_name)
+                        blob = bucket.blob(blob_name)
+                        markdown_content = await asyncio.to_thread(
+                            blob.download_as_text
+                        )
+                        outputs_list.append(
+                            BatchOutputItem(
+                                original_filename=original_fn,
+                                markdown_content=markdown_content,
+                                gcs_output_uri=gcs_uri,
+                            )
+                        )
+                    except Exception as e:
+                        print(f"Error downloading GCS content for {gcs_uri}: {e}")
+                        # If we can't download a supposedly successful file, list it as an error for this retrieval attempt
+                        errors_list.append(
+                            BatchJobFailedFileOutput(
+                                original_filename=original_fn,
+                                file_type="unknown_at_retrieval",  # We don't easily have file_type here from this query
+                                error_message=f"Failed to download content from GCS: {str(e)}",
+                                status="retrieval_error",
+                            )
+                        )
+
+            if job_status == "completed_with_errors":
+                message = "Job completed with some errors. See errors list."
+                failed_tasks_query = """
+                    SELECT original_filename, file_type, page_number, error_message, status 
+                    FROM file_tasks 
+                    WHERE batch_job_id = ? AND status = 'failed'
+                """
+                failed_tasks_tuples = con.execute(
+                    failed_tasks_query, (task_id,)
+                ).fetchall()
+                for (
+                    ft_orig_fn,
+                    ft_type,
+                    ft_page_num,
+                    ft_err_msg,
+                    ft_status,
+                ) in failed_tasks_tuples:
+                    errors_list.append(
+                        BatchJobFailedFileOutput(
+                            original_filename=ft_orig_fn,
+                            file_type=ft_type,
+                            page_number=ft_page_num,
+                            error_message=ft_err_msg,
+                            status=ft_status,
+                        )
+                    )
+            elif (
+                not outputs_list and not errors_list
+            ):  # Status was 'completed' but no files/uris found or downloaded
+                message = "Job reported as completed, but no output files were found or could be retrieved."
+
+        elif job_status == "completed_no_files":
+            message = "Job completed, but no files were processed (e.g., no supported files in input)."
+        else:  # Pending, processing, or failed states where individual outputs are not expected
+            message = f"Job is not yet fully completed or has failed. Current status: {job_status}"
+
+        return BatchJobOutputResponse(
+            job_id=job_id,
+            status=job_status,
+            outputs=outputs_list,
+            errors=errors_list,
+            message=message,
+        )
+    finally:
+        con.close()
+
+
 async def _process_single_non_pdf_file_and_upload(
     content_bytes: bytes,
     file_ext: str,
@@ -1252,135 +1394,3 @@ async def _run_gemini_pdf_batch_conversion(
         # For simplicity, not implemented in this iteration.
         # print(f"Cleaning up GCS temp files for {gemini_batch_sub_job_id} - not implemented")
         con.close()
-
-
-# Actual batch processing logic
-async def run_batch_task(
-    input_paths: Union[str, List[str]], output_gcs_path_str: str, task_id: str
-):
-    # This function is now OBSOLETE for the new /batch endpoint.
-    # It was designed for GCS path inputs and the old TASKS dictionary.
-    # Keeping it here for now to avoid breaking if it's called from somewhere else unexpectedly,
-    # but it should eventually be removed or refactored if any part is still needed.
-    # The new /batch flow uses _process_single_non_pdf_file_and_upload and _run_gemini_pdf_batch_conversion.
-    TASKS[task_id]["status"] = "initializing_OBSOLETE_PATH"
-    project_id = get_gcs_project_id()
-    credentials = get_gcs_credentials()
-
-    if (
-        not project_id and not credentials
-    ):  # Basic check if running outside GCP and no local creds
-        TASKS[task_id]["status"] = "error_OBSOLETE_PATH"
-        TASKS[task_id]["details"].append(
-            "GCS_PROJECT_ID not set or GOOGLE_APPLICATION_CREDENTIALS not found for GCS access (obsolete path)."
-        )
-        return
-
-    try:
-        storage_client = storage.Client(project=project_id, credentials=credentials)
-    except Exception as e:
-        TASKS[task_id]["status"] = "error_OBSOLETE_PATH"
-        TASKS[task_id]["details"].append(
-            f"Failed to initialize GCS client (obsolete path): {str(e)}"
-        )
-        return
-
-    TASKS[task_id]["status"] = "running_OBSOLETE_PATH"
-    files_to_process = []
-
-    pdf_backend_choice = get_pdf_backend()
-
-    try:
-        if isinstance(input_paths, str):  # It's a GCS directory path
-            TASKS[task_id]["details"].append(
-                f"Processing directory (obsolete path): {input_paths}"
-            )
-            bucket_name, prefix = input_paths.replace("gs://", "").split("/", 1)
-            bucket = storage_client.bucket(bucket_name)
-            blobs = list(bucket.list_blobs(prefix=prefix))
-            for blob in blobs:
-                if any(
-                    blob.name.lower().endswith(ext) for ext in SUPPORTED_EXTENSIONS
-                ) and not blob.name.endswith("/"):  # check if not a directory itself
-                    files_to_process.append((bucket_name, blob.name))
-        else:  # It's a list of GCS file paths
-            TASKS[task_id]["details"].append(
-                f"Processing list of files (obsolete path): {len(input_paths)} files"
-            )
-            for path_str in input_paths:
-                if not path_str.startswith("gs://"):
-                    TASKS[task_id]["details"].append(
-                        f"Skipping invalid GCS path (obsolete path): {path_str}"
-                    )
-                    continue
-                bucket_name, blob_name = path_str.replace("gs://", "").split("/", 1)
-                if any(blob_name.lower().endswith(ext) for ext in SUPPORTED_EXTENSIONS):
-                    files_to_process.append((bucket_name, blob_name))
-                else:
-                    TASKS[task_id]["details"].append(
-                        f"Skipping unsupported file type (obsolete path): {blob_name}"
-                    )
-
-        if not files_to_process:
-            TASKS[task_id]["details"].append(
-                "No supported files found to process (obsolete path)."
-            )
-            TASKS[task_id]["status"] = "completed_with_no_files_OBSOLETE_PATH"
-            return
-
-        TASKS[task_id]["total_files"] = len(files_to_process)
-        output_bucket_name, output_prefix = output_gcs_path_str.replace(
-            "gs://", ""
-        ).split("/", 1)
-        output_bucket = storage_client.bucket(output_bucket_name)
-
-        for i, (bucket_name, blob_name) in enumerate(files_to_process):
-            TASKS[task_id]["current_file_processing"] = (
-                f"{i + 1}/{len(files_to_process)}: {blob_name} (obsolete path)"
-            )
-            try:
-                input_bucket_obj = storage_client.bucket(bucket_name)
-                blob_obj = input_bucket_obj.blob(blob_name)
-                file_content_bytes = blob_obj.download_as_bytes()
-
-                file_ext = os.path.splitext(blob_name)[1].lower()
-
-                markdown_texts = await _process_file_content(
-                    file_ext, file_content_bytes, pdf_backend_choice
-                )
-
-                # Combine all pages/sections into a single markdown string for the output file
-                full_markdown_output = "\n\n---\n\n".join(markdown_texts)
-
-                output_blob_name = (
-                    output_prefix
-                    + "/"
-                    + os.path.basename(blob_name).rsplit(".", 1)[0]
-                    + ".md"
-                )
-
-                output_blob_obj = output_bucket.blob(output_blob_name)
-
-                output_blob_obj.upload_from_string(
-                    full_markdown_output, content_type="text/markdown"
-                )
-                TASKS[task_id]["processed_files"] += 1
-                TASKS[task_id]["details"].append(
-                    f"Successfully processed and uploaded (obsolete path): {blob_name} to {output_blob_obj.public_url if hasattr(output_blob_obj, 'public_url') else output_blob_obj.name}"
-                )
-            except Exception as e:
-                TASKS[task_id]["failed_files"] += 1
-                TASKS[task_id]["details"].append(
-                    f"Failed to process file {blob_name} (obsolete path): {str(e)}"
-                )
-
-        TASKS[task_id]["status"] = "completed_OBSOLETE_PATH"
-
-    except Exception as e:
-        TASKS[task_id]["status"] = "error_OBSOLETE_PATH"
-        TASKS[task_id]["details"].append(
-            f"An unexpected error occurred during batch processing (obsolete path): {str(e)}"
-        )
-    finally:
-        if "current_file_processing" in TASKS[task_id]:
-            del TASKS[task_id]["current_file_processing"]  # Clean up
