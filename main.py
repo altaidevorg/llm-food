@@ -47,13 +47,16 @@ match get_pdf_backend():
     case "gemini":
         from pdf2image import convert_from_bytes
         from google import genai
-        from google.genai.types import CreateBatchJobConfig, JobState, HttpOptions
+        from google.genai.types import CreateBatchJobConfig, JobState
 
-        prompt = """OCR this document to Markdown with text formatting such as bold, italic, headings, tables, numbered and bulleted lists properly rendered in Markdown Do not suround the out with Markdown fences. Preserve as much content as possible, such as headings, tables, lists. etc. Do not add any preamble or additional explanation of any other kind --simply output the well-formatted text output in Markdown."""
+        prompt = os.getenv(
+            "GEMINI_OCR_PROMPT",
+            """OCR this document to Markdown with text formatting such as bold, italic, headings, tables, numbered and bulleted lists properly rendered in Markdown Do not suround the out with Markdown fences. Preserve as much content as possible, such as headings, tables, lists. etc. Do not add any preamble or additional explanation of any other kind --simply output the well-formatted text output in Markdown.""",
+        )
     case invalid_backend:
         raise ValueError(f"Invalid PDF backend: {invalid_backend}")
 
-app = FastAPI()
+app = FastAPI(title="LLM Food", description="Serving files for hungry LLMs")
 
 # --- Security ---
 bearer_scheme = HTTPBearer(
