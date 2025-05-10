@@ -107,12 +107,7 @@ def get_gcs_credentials():
 def get_gemini_client():
     project = get_gcs_project_id()
     location = os.getenv("GOOGLE_CLOUD_LOCATION")
-    api_key = os.getenv("ALTAI_GEMINI_API_KEY")
-    client = (
-        genai.Client(vertexai=False, api_key=api_key)
-        if api_key
-        else genai.Client(vertexai=True, location=location, project=project)
-    )
+    client = genai.Client(vertexai=True, location=location, project=project)
     return client
 
 
@@ -219,7 +214,7 @@ initialize_db_schema()
 # --- Environment Variables for Batch Processing ---
 GCS_BATCH_BUCKET = os.getenv("GCS_BUCKET")
 GEMINI_MODEL_FOR_VISION = os.getenv(
-    "GEMINI_MODEL_FOR_VISION", "gemini-2.0-flash"
+    "GEMINI_MODEL_FOR_VISION", "gemini-2.0-flash-001"
 )  # Or other vision model
 
 if not GCS_BATCH_BUCKET:
@@ -469,8 +464,12 @@ async def batch_files_upload(
     main_batch_job_id = str(uuid.uuid4())
     current_time = datetime.utcnow()
 
-    pdf_files_for_gemini_batch: List[UploadFile] = []
-    non_pdf_files_for_individual_processing: List[UploadFile] = []
+    pdf_files_data_for_batch: List[
+        tuple[str, bytes]
+    ] = []  # Changed: Store (filename, content_bytes)
+    non_pdf_files_for_individual_processing: List[
+        UploadFile
+    ] = []  # Remains UploadFile for now as content is read just before adding task
 
     if not GCS_BATCH_BUCKET:
         raise HTTPException(
@@ -482,10 +481,13 @@ async def batch_files_upload(
             status_code=400, detail="Output GCS path must start with gs://"
         )
 
+    print("reading files...")
     for f in files:
         ext = os.path.splitext(f.filename)[1].lower()
         if ext == ".pdf":
-            pdf_files_for_gemini_batch.append(f)
+            # Read PDF content here and store bytes
+            content_bytes = await f.read()
+            pdf_files_data_for_batch.append((f.filename, content_bytes))
         elif ext in SUPPORTED_EXTENSIONS:  # Excludes .pdf as it's handled above
             non_pdf_files_for_individual_processing.append(f)
         else:
@@ -501,7 +503,7 @@ async def batch_files_upload(
                 output_gcs_path,
                 "pending",
                 current_time,
-                len(pdf_files_for_gemini_batch)
+                len(pdf_files_data_for_batch)
                 + len(non_pdf_files_for_individual_processing),
                 current_time,
             ),
@@ -542,7 +544,7 @@ async def batch_files_upload(
         con.commit()
 
         # Process PDF files via Gemini Batch
-        if pdf_files_for_gemini_batch:
+        if pdf_files_data_for_batch:
             gemini_batch_sub_job_id = str(uuid.uuid4())
             con.execute(
                 "INSERT INTO gemini_pdf_batch_sub_jobs (gemini_batch_sub_job_id, batch_job_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
@@ -554,20 +556,19 @@ async def batch_files_upload(
                     current_time,
                 ),
             )
-            # Pass the list of UploadFile objects. Content will be read in the task.
+            # Pass the list of (filename, content_bytes)
             background_tasks.add_task(
                 _run_gemini_pdf_batch_conversion,
-                [
-                    f for f in pdf_files_for_gemini_batch
-                ],  # Pass copies or ensure they are not closed
+                pdf_files_data_for_batch,  # Pass the list of (filename, content_bytes)
                 output_gcs_path,
                 main_batch_job_id,
                 gemini_batch_sub_job_id,
             )
+            print("Added background tasks for batch prediction PDF")
             con.commit()  # Commit after starting PDF batch task prep
 
         # Update batch job status to processing if there are tasks
-        if pdf_files_for_gemini_batch or non_pdf_files_for_individual_processing:
+        if pdf_files_data_for_batch or non_pdf_files_for_individual_processing:
             con.execute(
                 "UPDATE batch_jobs SET status = ?, last_updated_at = ? WHERE job_id = ?",
                 ("processing", datetime.utcnow(), main_batch_job_id),
@@ -581,7 +582,7 @@ async def batch_files_upload(
 
     finally:
         con.close()
-
+    print("returning from /batch endpint")
     return {"task_id": main_batch_job_id}
 
 
@@ -696,7 +697,9 @@ async def _process_single_non_pdf_file_and_upload(
 
 
 async def _run_gemini_pdf_batch_conversion(
-    pdf_files_list: List[UploadFile],  # List of UploadFile objects
+    pdf_inputs_list: List[
+        tuple[str, bytes]
+    ],  # Changed: Expect list of (filename, content_bytes)
     output_gcs_path_str: str,
     main_batch_job_id: str,
     gemini_batch_sub_job_id: str,
@@ -732,10 +735,13 @@ async def _run_gemini_pdf_batch_conversion(
 
         temp_bucket = storage_client.bucket(GCS_BATCH_BUCKET)
 
-        for pdf_upload_file in pdf_files_list:
-            original_pdf_filename = pdf_upload_file.filename
-            pdf_content_bytes = await pdf_upload_file.read()
-            await pdf_upload_file.close()  # Close the file after reading
+        for (
+            original_pdf_filename,
+            pdf_content_bytes,
+        ) in pdf_inputs_list:  # Changed: Iterate through (filename, content_bytes)
+            # original_pdf_filename = pdf_upload_file.filename # Removed
+            # pdf_content_bytes = await pdf_upload_file.read() # Removed
+            # await pdf_upload_file.close() # Removed
 
             try:
                 page_images = convert_from_bytes(pdf_content_bytes, fmt="png")
@@ -861,7 +867,7 @@ async def _run_gemini_pdf_batch_conversion(
             # This logic might need to be more sophisticated at the batch_jobs level based on counts
             con.execute(
                 "UPDATE batch_jobs SET overall_failed_count = overall_failed_count + ? WHERE job_id = ?",
-                (len(pdf_files_list), main_batch_job_id),
+                (len(pdf_inputs_list), main_batch_job_id),
             )
             con.commit()
             return
@@ -890,24 +896,14 @@ async def _run_gemini_pdf_batch_conversion(
 
         # Submit to Gemini Batch API
         gemini_output_uri_for_job = f"gs://{GCS_BATCH_BUCKET}/{temp_gcs_output_prefix}"
-        batch_job_config = CreateBatchJobConfig(
-            destination_uri=gemini_output_uri_for_job
-        )
+        batch_job_config = CreateBatchJobConfig(dest=gemini_output_uri_for_job)
 
-        # Ensure client is correctly initialized for batch (Vertex AI or API Key)
-        # The article uses client = genai.Client(http_options=HttpOptions(api_version="v1"), vertexai=True, project=PROJECT_ID, location=LOCATION)
-        # We are using get_gemini_client() which needs to be aligned.
-        # For now, assuming get_gemini_client() is correctly configured for the target (Vertex or Generative Language API batch)
-
-        # Note: google-genai client.batches.create is synchronous and polls internally.
-        # For very long jobs, a truly async submission and separate polling might be better,
-        # but for now, this background task will run it.
         print(
             f"Submitting batch job to Gemini for {gemini_batch_sub_job_id} with model {GEMINI_MODEL_FOR_VISION}"
         )
         gemini_job = gemini_client.batches.create(
-            model=f"models/{GEMINI_MODEL_FOR_VISION}",  # Model name might need prefix
-            source_uri=payload_gcs_uri,
+            model=GEMINI_MODEL_FOR_VISION,
+            src=payload_gcs_uri,
             config=batch_job_config,
         )
         # The create call above blocks until job completion or failure for google-genai,
@@ -1159,7 +1155,7 @@ async def _run_gemini_pdf_batch_conversion(
             )
             con.execute(
                 "UPDATE batch_jobs SET overall_failed_count = overall_failed_count + ? WHERE job_id = ?",
-                (len(pdf_files_list), main_batch_job_id),
+                (len(pdf_inputs_list), main_batch_job_id),
             )  # Approx count
             con.commit()
 
