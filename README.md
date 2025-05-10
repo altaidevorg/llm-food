@@ -121,7 +121,7 @@ The package defines several dependency groups (extras):
 2. To install only the client and CLI (e.g., on a different machine):
 
    ```bash
-   pip install llm-food  # (Once published to PyPI)
+   pip install llm-food
    # Or, from a cloned repository:
    # pip install .
    ```
