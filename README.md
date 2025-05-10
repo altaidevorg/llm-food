@@ -102,7 +102,7 @@ GCS_BUCKET=
 GOOGLE_APPLICATION_CREDENTIALS=
 
 # Gemini Model for Vision (used by /batch for PDF OCR via Gemini Batch API, and by POST /convert if PDF_BACKEND='gemini')
-# Example: GEMINI_MODEL_FOR_VISION=gemini-1.5-flash-latest or gemini-pro-vision or gemini-2.0-flash-001
+# Example: GEMINI_MODEL_FOR_VISION=gemini-2.0-flash-001
 GEMINI_MODEL_FOR_VISION=gemini-2.0-flash-001
 
 # Custom OCR Prompt for Gemini (Optional)

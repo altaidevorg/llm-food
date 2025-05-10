@@ -109,7 +109,7 @@ def get_gcs_credentials():
 
 def get_gemini_client():
     project = get_gcs_project_id()
-    location = os.getenv("GOOGLE_CLOUD_LOCATION")
+    location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
     client = genai.Client(vertexai=True, location=location, project=project)
     return client
 
