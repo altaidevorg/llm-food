@@ -342,7 +342,7 @@ async def _process_file_content(
             results = await asyncio.gather(
                 *[
                     client.aio.models.generate_content(
-                        model="gemini-2.0-flash", contents=payload
+                        model=GEMINI_MODEL_FOR_VISION, contents=payload
                     )
                     for payload in payloads
                 ]
