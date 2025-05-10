@@ -102,10 +102,12 @@ def get_gcs_credentials():
 
 def get_gemini_client():
     project = get_gcs_project_id()
-    location = "us-central1"
+    location = os.getenv("GOOGLE_CLOUD_LOCATION")
     api_key = os.getenv("ALTAI_GEMINI_API_KEY")
     client = (
-        genai.Client(vertexai=False, api_key=api_key) if api_key else genai.Client()
+        genai.Client(vertexai=False, api_key=api_key)
+        if api_key
+        else genai.Client(vertexai=True, location=location, project=project)
     )
     return client
 

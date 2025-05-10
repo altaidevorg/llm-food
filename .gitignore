@@ -1,1 +1,15 @@
+# cache
 __pycache__/
+
+# configuration
+*.env
+
+# artifacts
+*.docs
+*.json
+*.jsonl
+*.htm
+*.html
+*.pdf
+*.pptx
+*.rtf
