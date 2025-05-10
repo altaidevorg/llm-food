@@ -3,8 +3,9 @@
 import asyncio
 import argparse
 import os
+import sys
 import json
-from typing import List, Optional
+from typing import Optional
 
 # Assuming client.py is in the same package
 from .client import LLMFoodClient, LLMFoodClientError
@@ -91,27 +92,24 @@ async def main_async():
     except LLMFoodClientError as e:
         print(
             f"Client Error: {e}",
-            file=sys.stderr if "sys" in globals() else os.sys.stderr,
+            file=sys.stderr,
         )  # Print to stderr
         if e.response_text:
             print(
                 f"Server Response: {e.response_text}",
-                file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                file=sys.stderr,
             )
         exit(1)
     except Exception as e:
         print(
             f"An unexpected error occurred: {e}",
-            file=sys.stderr if "sys" in globals() else os.sys.stderr,
+            file=sys.stderr,
         )
         exit(1)
 
 
 def main():
     # Wrapper to handle async execution for console_scripts
-    # Add sys import for stderr printing in error handling
-    global sys
-    import sys
 
     if hasattr(asyncio, "run"):  # Python 3.7+
         asyncio.run(main_async())
