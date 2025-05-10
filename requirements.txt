@@ -9,6 +9,8 @@ trafilatura
 pymupdf4llm
 pypdf
 google-cloud-storage
+google-genai
 httpx
 python-multipart
 pdf2image
+duckdb

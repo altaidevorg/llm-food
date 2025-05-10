@@ -12,7 +12,7 @@ WORKDIR /app
 # Install system dependencies that might be needed by some Python packages
 # e.g., pymupdf might need some C libraries. 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
+    build-essential poppler-utils \
     # Add other system dependencies if needed by your Python packages, e.g., for OCR: tesseract-ocr
     && rm -rf /var/lib/apt/lists/*
 
