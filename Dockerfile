@@ -16,20 +16,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Add other system dependencies if needed by your Python packages, e.g., for OCR: tesseract-ocr
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the requirements file into the container
-COPY requirements.txt .
+# Copy the project
+COPY . .
 
-# Install any needed packages specified in requirements.txt using uv
+# Install the package using uv
 # Use --system to install into the system Python environment within the container
 # Use --no-cache to avoid caching, similar to pip's --no-cache-dir
-RUN uv pip install --system --no-cache -r requirements.txt
-
-# Copy the rest of the application code into the container
-COPY . .
+RUN uv pip install --system --no-cache .[server]
 
 # Expose the port the app runs on
 EXPOSE 8000
 
 # Define the command to run the application
 # Use 0.0.0.0 to allow external connections to the container
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"] 
+CMD ["llm-food-serve"]

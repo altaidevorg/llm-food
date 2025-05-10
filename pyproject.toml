@@ -1,0 +1,53 @@
+[project]
+name = "llm-food"
+version = "0.1.0"
+keywords = ["llm-food", "pdf-to-markdown", "text-extraction", "rag"]
+authors = [
+    { name = "Yusuf Sarıgöz", email = "yusufsarigoz@gmail.com"}
+]
+description = "Serving files for hungry LLMs"
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "httpx>=0.28.1",
+    "pydantic>=2.10.3",
+]
+
+[tool.setuptools]
+packages = ["llm_food"]
+
+[project.urls]
+homepage = "https://github.com/altaidevorg/llm-food"
+project = "https://github.com/altaidevorg/llm-food"
+repository = "https://github.com/altaidevorg/llm-food"
+
+
+[project.optional-dependencies]
+server = [
+    "duckdb",
+    "fastapi",
+    "google-genai",
+    "google-cloud-storage",
+    "mammoth",
+    "markdownify",
+    "pdf2image",
+    "pypdf2",
+    "python-multipart",
+    "python-pptx",
+    "striprtf",
+    "trafilatura",
+    "uvicorn",
+]
+pymupdf = ["pymupdf4llm"]
+
+[project.entry-points.console_scripts]
+llm-food = "llm_food.cli:main"
+llm-food-serve = "llm_food.app:main"

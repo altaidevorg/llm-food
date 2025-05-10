@@ -1,3 +1,13 @@
+import asyncio
+import base64
+
+from datetime import datetime
+import hashlib
+import json
+from io import BytesIO
+import os
+from typing import List, Optional
+import uuid
 from fastapi import (
     FastAPI,
     UploadFile,
@@ -9,35 +19,40 @@ from fastapi import (
     Form,
 )
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
-import asyncio
-import base64
-from typing import List, Union, Optional
-import uuid
-import os
-import hashlib
+
 import httpx
 import mammoth
 import duckdb
-from datetime import datetime
-import json
 
 # Imports for GCS
 from google.cloud import storage
 from google.oauth2 import service_account  # For local testing with service account
 from markdownify import markdownify
 
-from io import BytesIO
 from striprtf.striprtf import rtf_to_text
 from pptx import Presentation
 import trafilatura
 
+from .config import (
+    get_pdf_backend,
+    get_gemini_prompt,
+    get_api_auth_token,
+    get_gcs_project_id,
+    get_max_file_size_bytes,
+    DUCKDB_FILE,
+    GCS_BATCH_BUCKET,
+    GEMINI_MODEL_FOR_VISION,
+    SUPPORTED_EXTENSIONS,
+)
+
+from .models import (
+    BatchJobFailedFileOutput,
+    BatchJobOutputResponse,
+    BatchOutputItem,
+    ConversionResponse,
+)
 
 # --- Conditional imports based on the PDF backend ---
-def get_pdf_backend():
-    return os.getenv("PDF_BACKEND", "gemini")
-
-
 match get_pdf_backend():
     case "pymupdf4llm":
         from pymupdf4llm import to_markdown
@@ -49,23 +64,21 @@ match get_pdf_backend():
         from google import genai
         from google.genai.types import CreateBatchJobConfig, JobState
 
-        prompt = os.getenv(
-            "GEMINI_OCR_PROMPT",
-            """OCR this document to Markdown with text formatting such as bold, italic, headings, tables, numbered and bulleted lists properly rendered in Markdown Do not suround the out with Markdown fences. Preserve as much content as possible, such as headings, tables, lists. etc. Do not add any preamble or additional explanation of any other kind --simply output the well-formatted text output in Markdown.""",
-        )
+        OCR_PROMPT = get_gemini_prompt()
     case invalid_backend:
         raise ValueError(f"Invalid PDF backend: {invalid_backend}")
 
-app = FastAPI(title="LLM Food", description="Serving files for hungry LLMs")
+# --- Main application setup ---
+app = FastAPI(
+    title="LLM Food API",
+    description="API for converting various document formats to Markdown or text, with batch processing capabilities.",
+    version="0.2.0",
+)
 
 # --- Security ---
 bearer_scheme = HTTPBearer(
     auto_error=False
 )  # auto_error=False to handle optional token & custom errors
-
-
-def get_api_auth_token() -> Optional[str]:
-    return os.getenv("API_AUTH_TOKEN")
 
 
 async def authenticate_request(
@@ -94,11 +107,6 @@ async def authenticate_request(
     return
 
 
-# other configuration
-def get_gcs_project_id():
-    return os.getenv("GOOGLE_CLOUD_PROJECT")
-
-
 # For local GCS testing with a service account JSON file
 def get_gcs_credentials():
     credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -114,64 +122,7 @@ def get_gemini_client():
     return client
 
 
-def get_max_file_size_bytes() -> Union[int, None]:
-    max_size_mb_str = os.getenv("MAX_FILE_SIZE_MB")
-    if max_size_mb_str:
-        try:
-            max_size_mb = int(max_size_mb_str)
-            if max_size_mb > 0:
-                return max_size_mb * 1024 * 1024  # Convert MB to Bytes
-            else:
-                # Log this invalid configuration? For now, treat as no limit.
-                pass
-        except ValueError:
-            # Log this invalid configuration? For now, treat as no limit.
-            pass
-    return None  # No limit or invalid value treated as no limit
-
-
-SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".rtf", ".pptx", ".html", ".htm"]
-
-
-class ConversionResponse(BaseModel):
-    filename: str
-    content_hash: str
-    texts: List[str]
-
-
-class BatchRequest(BaseModel):
-    input_paths: Union[str, List[str]]
-    output_path: str
-
-
-# Pydantic models for GET /batch/{task_id} response
-class BatchOutputItem(BaseModel):
-    original_filename: str
-    markdown_content: str
-    gcs_output_uri: str
-
-
-class BatchJobFailedFileOutput(BaseModel):
-    original_filename: str
-    file_type: str
-    page_number: Optional[int] = None
-    error_message: Optional[str] = None
-    status: str
-
-
-class BatchJobOutputResponse(BaseModel):
-    job_id: str
-    status: str
-    outputs: List[BatchOutputItem] = []
-    errors: List[BatchJobFailedFileOutput] = []
-    message: Optional[str] = None
-
-
 TASKS = {}
-
-
-# --- DuckDB Setup ---
-DUCKDB_FILE = os.getenv("DUCKDB_FILE", "batch_tasks.duckdb")
 
 
 def get_db_connection():
@@ -235,18 +186,6 @@ def initialize_db_schema():
 
 # Call initialization at startup
 initialize_db_schema()
-
-
-# --- Environment Variables for Batch Processing ---
-GCS_BATCH_BUCKET = os.getenv("GCS_BUCKET")
-GEMINI_MODEL_FOR_VISION = os.getenv(
-    "GEMINI_MODEL_FOR_VISION", "gemini-2.0-flash-001"
-)  # Or other vision model
-
-if not GCS_BATCH_BUCKET:
-    print(
-        "Warning: GCS_BUCKET environment variable is not set. PDF batch processing will fail."
-    )
 
 
 def _process_docx_sync(content_bytes: bytes) -> List[str]:
@@ -335,7 +274,7 @@ async def _process_file_content(
             payloads = [
                 [
                     {"inline_data": {"data": b64_str, "mime_type": "image/png"}},
-                    {"text": prompt},
+                    {"text": OCR_PROMPT},
                 ]
                 for b64_str in images_b64
             ]
@@ -978,7 +917,7 @@ async def _run_gemini_pdf_batch_conversion(
                                                     "mime_type": "image/png",
                                                 }
                                             },
-                                            {"text": prompt},
+                                            {"text": OCR_PROMPT},
                                         ],
                                     }
                                 ]
@@ -1463,3 +1402,27 @@ async def _check_and_finalize_batch_job_status(
             f"Error in _check_and_finalize_batch_job_status for {main_batch_job_id}: {e}"
         )
         # Optionally, update main batch job to a specific error state if this check itself fails critically
+
+
+# --- Main function for Uvicorn ---
+def main():
+    import uvicorn
+
+    # Read host and port from environment variables or use defaults
+    host = os.getenv("LLM_FOOD_HOST", "0.0.0.0")
+    port = int(os.getenv("LLM_FOOD_PORT", "8000"))
+    reload = (
+        os.getenv("LLM_FOOD_RELOAD", "false").lower() == "true"
+    )  # Added reload option
+
+    print(
+        f"Starting server on {host}:{port} with reload={'enabled' if reload else 'disabled'}"
+    )
+    uvicorn.run(
+        "llm_food.app:app", host=host, port=port, reload=reload
+    )  # Corrected to pass app string for reload
+
+
+if __name__ == "__main__":
+    # This allows running the FastAPI app directly using `python -m llm_food.app`
+    main()
