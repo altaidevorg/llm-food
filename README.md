@@ -125,7 +125,7 @@ DUCKDB_FILE=batch_tasks.duckdb
   * Storing temporary intermediate files for PDF batch processing (page images, `payload.jsonl`).
   * The `output_gcs_path` provided in the `/batch` request will also typically be a path *within* this bucket (e.g., `gs://YOUR_GCS_BUCKET/final_markdowns/`). Ensure the service account has appropriate permissions (Storage Object Admin on this bucket is recommended).
 * `GOOGLE_APPLICATION_CREDENTIALS`: For local development or non-GCP environments to authenticate GCS and Gemini calls.
-* `GEMINI_MODEL_FOR_VISION`: Specifies the Gemini model used for OCR. The `/batch` endpoint uses this for batch predictions. The `/convert` endpoint uses "gemini-1.0-pro-vision" (hardcoded for its synchronous image-to-text) if `PDF_BACKEND` is 'gemini', but `/batch` uses this variable. *(Correction from code: `/convert` uses `gemini-2.0-flash` for its synchronous calls, `/batch` uses `GEMINI_MODEL_FOR_VISION`)*
+Gemini model used for OCR. The `/batch` endpoint uses this for batch predictions, and it's also used by the `POST /convert` endpoint if `PDF_BACKEND` is 'gemini'.
 * `GEMINI_OCR_PROMPT`: Allows customization of the prompt sent to Gemini for OCR tasks.
 * `DUCKDB_FILE`: Path where the DuckDB database file for task tracking will be stored.
 
