@@ -1,0 +1,3 @@
+[console_scripts]
+llm-food = llm_food.cli:main
+llm-food-serve = llm_food.app:main

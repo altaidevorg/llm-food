@@ -21,6 +21,9 @@ dependencies = [
     "pydantic>=2.10.3",
 ]
 
+[tool.setuptools]
+packages = ["llm_food"]
+
 [project.urls]
 homepage = "https://github.com/altaidevorg/llm-food"
 project = "https://github.com/altaidevorg/llm-food"
@@ -29,16 +32,19 @@ repository = "https://github.com/altaidevorg/llm-food"
 
 [project.optional-dependencies]
 server = [
-    "uvicorn",
+    "duckdb",
     "fastapi",
     "google-genai",
+    "google-cloud-storage",
+    "mammoth",
     "markdownify",
-    "trafilatura",
+    "pdf2image",
+    "pypdf2",
     "python-multipart",
     "python-pptx",
-    "pypdf2",
     "striprtf",
-    "duckdb",
+    "trafilatura",
+    "uvicorn",
 ]
 pymupdf = ["pymupdf4llm"]
 

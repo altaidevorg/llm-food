@@ -6,7 +6,7 @@ def get_pdf_backend():
     return os.getenv("PDF_BACKEND", "gemini")
 
 
-"""Configuration and environmant variablss"""
+"""Configuration and environment variables"""
 
 DEFAULT_GEMINI_OCR_PROMPT = """OCR this document to Markdown with text formatting such as bold, italic, headings, tables, numbered and bulleted lists properly rendered in Markdown Do not suround the out with Markdown fences. Preserve as much content as possible, such as headings, tables, lists. etc. Do not add any preamble or additional explanation of any other kind --simply output the well-formatted text output in Markdown."""
 

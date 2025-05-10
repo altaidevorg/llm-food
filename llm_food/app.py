@@ -68,7 +68,12 @@ match get_pdf_backend():
     case invalid_backend:
         raise ValueError(f"Invalid PDF backend: {invalid_backend}")
 
-app = FastAPI(title="LLM Food", description="Serving files for hungry LLMs")
+# --- Main application setup ---
+app = FastAPI(
+    title="LLM Food API",
+    description="API for converting various document formats to Markdown or text, with batch processing capabilities.",
+    version="0.2.0",
+)
 
 # --- Security ---
 bearer_scheme = HTTPBearer(
@@ -1397,3 +1402,27 @@ async def _check_and_finalize_batch_job_status(
             f"Error in _check_and_finalize_batch_job_status for {main_batch_job_id}: {e}"
         )
         # Optionally, update main batch job to a specific error state if this check itself fails critically
+
+
+# --- Main function for Uvicorn ---
+def main():
+    import uvicorn
+
+    # Read host and port from environment variables or use defaults
+    host = os.getenv("LLM_FOOD_HOST", "0.0.0.0")
+    port = int(os.getenv("LLM_FOOD_PORT", "8000"))
+    reload = (
+        os.getenv("LLM_FOOD_RELOAD", "false").lower() == "true"
+    )  # Added reload option
+
+    print(
+        f"Starting server on {host}:{port} with reload={'enabled' if reload else 'disabled'}"
+    )
+    uvicorn.run(
+        "llm_food.app:app", host=host, port=port, reload=reload
+    )  # Corrected to pass app string for reload
+
+
+if __name__ == "__main__":
+    # This allows running the FastAPI app directly using `python -m llm_food.app`
+    main()
