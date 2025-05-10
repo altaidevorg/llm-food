@@ -13,3 +13,4 @@ google-genai
 httpx
 python-multipart
 pdf2image
+duckdb
