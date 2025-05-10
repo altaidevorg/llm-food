@@ -1,5 +1,7 @@
 # cache
 __pycache__/
+.ruff_cache
+*.egg-info
 
 # configuration
 *.env
