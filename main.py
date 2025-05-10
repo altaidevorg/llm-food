@@ -582,7 +582,7 @@ async def batch_files_upload(
 
     finally:
         con.close()
-    print("returning from /batch endpint")
+    await asyncio.sleep(0.01)  # tick so the event loop gets forward
     return {"task_id": main_batch_job_id}
 
 
@@ -699,11 +699,13 @@ async def _process_single_non_pdf_file_and_upload(
 async def _run_gemini_pdf_batch_conversion(
     pdf_inputs_list: List[
         tuple[str, bytes]
-    ],  # Changed: Expect list of (filename, content_bytes)
+    ],  # Expect list of (filename, content_bytes)
     output_gcs_path_str: str,
     main_batch_job_id: str,
     gemini_batch_sub_job_id: str,
 ):
+    await asyncio.sleep(0.1)  # tick event loop
+
     current_time = datetime.utcnow()
     con = get_db_connection()
     storage_client = storage.Client(
@@ -815,12 +817,17 @@ async def _run_gemini_pdf_batch_conversion(
                             "request": {
                                 "contents": [
                                     {
-                                        "file_data": {
-                                            "file_uri": image_gcs_uri,
-                                            "mime_type": "image/png",
-                                        }
-                                    },
-                                    {"text": prompt},  # Using the global prompt for OCR
+                                        "role": "user",
+                                        "parts": [
+                                            {
+                                                "file_data": {
+                                                    "file_uri": image_gcs_uri,
+                                                    "mime_type": "image/png",
+                                                }
+                                            },
+                                            {"text": prompt},
+                                        ],
+                                    }
                                 ]
                             },
                         }
@@ -930,6 +937,54 @@ async def _run_gemini_pdf_batch_conversion(
         # but useful if it returns immediately.
         # For google-genai, `create` is blocking and polls until completion. `get` is then used to refresh state if needed.
         # Let's assume `gemini_job` is the final state object after `create()` completes.
+
+        # Corrected Polling Logic based on user feedback
+        polling_interval_seconds = 30
+        completed_job_states = {
+            JobState.JOB_STATE_SUCCEEDED,
+            JobState.JOB_STATE_FAILED,
+            JobState.JOB_STATE_CANCELLED,
+            JobState.JOB_STATE_PAUSED,  # Considering PAUSED as a state to stop active polling, might need review
+        }
+
+        while gemini_job.state not in completed_job_states:
+            await asyncio.sleep(polling_interval_seconds)
+            try:
+                refreshed_job = gemini_client.batches.get(name=gemini_job.name)
+                if refreshed_job.state != gemini_job.state:
+                    gemini_job = refreshed_job  # Update job object only if state changed or to get latest info
+                    print(
+                        f"Gemini job {gemini_job.name} polling. Current state: {gemini_job.state}"
+                    )
+                    con.execute(
+                        "UPDATE gemini_pdf_batch_sub_jobs SET status = ?, updated_at = ? WHERE gemini_batch_sub_job_id = ?",
+                        (
+                            str(gemini_job.state),
+                            datetime.utcnow(),
+                            gemini_batch_sub_job_id,
+                        ),
+                    )
+                    con.commit()
+                else:
+                    # Optional: print a less verbose polling message if state hasn't changed
+                    # print(f"Gemini job {gemini_job.name} still in state: {gemini_job.state}")
+                    pass  # State unchanged, continue polling
+            except Exception as e:
+                print(
+                    f"Error during Gemini job polling for {gemini_job.name}: {e}. Will retry polling."
+                )
+                # Decide if certain errors should break the loop or be retried.
+                # For now, simple retry after sleep.
+
+        # Final state update after loop
+        con.execute(
+            "UPDATE gemini_pdf_batch_sub_jobs SET status = ?, updated_at = ? WHERE gemini_batch_sub_job_id = ?",
+            (str(gemini_job.state), datetime.utcnow(), gemini_batch_sub_job_id),
+        )
+        con.commit()
+        print(
+            f"Gemini job {gemini_job.name} polling finished. Final state: {gemini_job.state}"
+        )
 
         if gemini_job.state == JobState.JOB_STATE_SUCCEEDED:
             con.execute(
