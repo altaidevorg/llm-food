@@ -604,6 +604,10 @@ async def batch_files_upload(
         con.commit()
 
     finally:
+        await _check_and_finalize_batch_job_status(
+            main_batch_job_id, con
+        )  # Call before closing
+        con.commit()  # Ensure final status update is committed
         con.close()
     await asyncio.sleep(0.01)  # tick so the event loop gets forward
     return {"task_id": main_batch_job_id}
@@ -835,6 +839,10 @@ async def _process_single_non_pdf_file_and_upload(
                 f"Additionally, failed to update DB for task {file_task_id} failure: {db_err}"
             )
     finally:
+        await _check_and_finalize_batch_job_status(
+            main_batch_job_id, con
+        )  # Call before closing
+        con.commit()  # Ensure final status update is committed
         con.close()
 
 
@@ -1393,4 +1401,62 @@ async def _run_gemini_pdf_batch_conversion(
         # This requires listing and deleting, can be a separate cleanup task or done here.
         # For simplicity, not implemented in this iteration.
         # print(f"Cleaning up GCS temp files for {gemini_batch_sub_job_id} - not implemented")
+        await _check_and_finalize_batch_job_status(
+            main_batch_job_id, con
+        )  # Call before closing
+        con.commit()  # Ensure final status update is committed
         con.close()
+
+
+async def _check_and_finalize_batch_job_status(
+    main_batch_job_id: str, con: duckdb.DuckDBPyConnection
+):
+    """Checks if all tasks for a batch job are completed and updates the main job status.
+    This function assumes the connection `con` is open and does not close it.
+    """
+    try:
+        job_info = con.execute(
+            "SELECT total_input_files, overall_processed_count, overall_failed_count, status FROM batch_jobs WHERE job_id = ?",
+            (main_batch_job_id,),
+        ).fetchone()
+
+        if not job_info:
+            print(
+                f"_check_and_finalize_batch_job_status: Batch job {main_batch_job_id} not found."
+            )
+            return
+
+        total_files, processed_count, failed_count, current_status = job_info
+
+        # If already in a final state, no need to update further by this check.
+        if current_status in [
+            "completed",
+            "completed_with_errors",
+            "failed_catastrophic",
+            "completed_no_files",
+        ]:
+            return
+
+        if (processed_count + failed_count) >= total_files:
+            new_status = ""
+            if failed_count > 0:
+                new_status = "completed_with_errors"
+            else:
+                new_status = "completed"
+
+            if new_status:
+                print(
+                    f"Finalizing batch job {main_batch_job_id} to status: {new_status}"
+                )
+                con.execute(
+                    "UPDATE batch_jobs SET status = ?, last_updated_at = ? WHERE job_id = ?",
+                    (new_status, datetime.utcnow(), main_batch_job_id),
+                )
+                # No commit here, assuming caller will commit or it's part of a larger transaction within the caller.
+                # However, for safety if called at the very end, a commit might be desired directly here.
+                # For now, let the caller manage commit after this check.
+    except Exception as e:
+        print(
+            f"Error in _check_and_finalize_batch_job_status for {main_batch_job_id}: {e}"
+        )
+        # Optionally, update main batch job to a specific error state if this check itself fails critically
