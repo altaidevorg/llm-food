@@ -202,9 +202,7 @@ If the `API_AUTH_TOKEN` environment variable is set, all API endpoints will be p
 If the token is not set, the API is accessible without authentication.
 
 ## License Considerations
-
-* **Core Application:** (Specify your intended license for `llm-food` itself, e.g., MIT, Apache 2.0)
-* **Gemini:** PDF processing via Gemini uses Google's Generative AI SDK. Review Google's terms of service.
+ **Gemini:** PDF processing via Gemini uses Google's Generative AI SDK. Review Google's terms of service.
 * **Alternative PDF Backends (for `/convert`):**
   * `pymupdf4llm`: Licensed under AGPLv3.
   * `pypdf2` (via `pypdf`): Typically uses permissive licenses (MIT/BSD).
