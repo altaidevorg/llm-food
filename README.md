@@ -8,9 +8,11 @@
 
 ## Overview
 
-`llm-food` is a FastAPI-based microservice designed to convert various input document formats into clean Markdown text. This output is optimized for downstream Large Language Model (LLM) pipelines, such as those used for Retrieval Augmented Generation (RAG) or fine-tuning.
+`llm-food` is a Python package that provides a FastAPI-based microservice (the **server**) for converting various input document formats into clean Markdown text. This output is optimized for downstream Large Language Model (LLM) pipelines, such as those used for Retrieval Augmented Generation (RAG) or fine-tuning.
 
-The service supports:
+The package also includes a Python **client** library and a command-line interface (**CLI**) for easy interaction with the server.
+
+The server supports:
 
 * Synchronous single file processing via file upload (`/convert`).
 * Synchronous URL-to-Markdown conversion (`/convert?url=...`).
@@ -20,32 +22,225 @@ The service supports:
 ## Features
 
 * **Multiple Format Support:** Convert PDF, DOC/DOCX, RTF, PPTX, and HTML/webpages to Markdown.
-* **Advanced PDF Processing (Synchronous):** The `/convert` endpoint can use Google's Gemini model for high-quality OCR of single PDFs, with alternative backends (`pymupdf4llm`, `pypdf2`) available.
-* **Scalable Batch PDF Processing:** The `/batch` endpoint uses Google's Gemini Batch Prediction API for efficient and potentially cost-effective conversion of multiple PDFs. Page images are temporarily stored in GCS, and a batch job is submitted to Gemini.
-* **Batch Processing for Other Formats:** Non-PDF files uploaded to `/batch` (DOCX, RTF, PPTX, HTML) are processed individually as background tasks.
-* **Asynchronous Operations:** All batch processing tasks are handled asynchronously, allowing the server to remain responsive.
-* **Task Management with DuckDB:** Batch job progress, individual file statuses, and GCS output locations are tracked in a local DuckDB database.
-* **Status & Result Retrieval:**
-  * `GET /status/{task_id}`: Check the detailed status of an asynchronous batch job and its sub-tasks.
-  * `GET /batch/{task_id}`: Retrieve the Markdown output of successfully completed files from a batch job by downloading them from GCS.
-* **Configurable File Size Limit:** Set a maximum size for uploaded files (applies to synchronous `/convert` endpoint).
-* **Optional Authentication:** Secure all endpoints with a Bearer token.
-* **Dockerized:** Ready for containerized deployment.
+* **Advanced PDF Processing (Synchronous Server):** The server's `/convert` endpoint can use Google's Gemini model for high-quality OCR of single PDFs, with alternative backends (`pymupdf4llm`, `pypdf2`) available via server configuration.
+* **Scalable Batch PDF Processing (Server):** The server's `/batch` endpoint uses Google's Gemini Batch Prediction API for efficient and potentially cost-effective conversion of multiple PDFs.
+* **Batch Processing for Other Formats (Server):** Non-PDF files uploaded to `/batch` (DOCX, RTF, PPTX, HTML) are processed individually as background tasks on the server.
+* **Asynchronous Operations (Server):** All batch processing tasks are handled asynchronously by the server.
+* **Task Management with DuckDB (Server):** Batch job progress, individual file statuses, and GCS output locations are tracked in a local DuckDB database on the server.
+* **Status & Result Retrieval (Server):** API endpoints to check job status and retrieve results.
+* **Python Client & CLI:**
+  * Programmatic access to all server endpoints via an `async` Python client.
+  * Command-line interface for easy interaction with the server (file conversion, batch jobs, status checks).
+* **Configurable File Size Limit (Server):** Set a maximum size for uploaded files.
+* **Optional Authentication (Server):** Secure all server endpoints with a Bearer token.
+* **Dockerized Server:** Ready for containerized deployment.
 
-## Supported Formats & Processing
+## Supported Formats & Processing (Server-Side)
 
 | Format    | Extractor Library/Method Used                                  | `/convert` (Single File) | `/batch` (Multiple Files)                                     |
 | :-------- | :------------------------------------------------------------- | :----------------------- | :------------------------------------------------------------ |
-| PDF       | `google-genai` (Gemini - default) / `pymupdf4llm` / `pypdf` | Yes                      | Yes (via Gemini Batch API, temporary page images stored in GCS) |
+| PDF       | `google-genai` (Gemini - default) / `pymupdf4llm` / `pypdf`    | Yes                      | Yes (via Gemini Batch API, temporary page images stored in GCS) |
 | DOC/DOCX  | `mammoth`                                                      | Yes                      | Yes (individual background task)                                |
 | RTF       | `striprtf`                                                     | Yes                      | Yes (individual background task)                                |
 | PPTX      | `python-pptx`                                                  | Yes                      | Yes (individual background task)                                |
 | HTML/URLs | `trafilatura`                                                  | Yes (file or URL)        | Yes (HTML files, individual background task)                  |
 
-## API Endpoints
+## Installation & Usage
+
+This project is a Python package and can be installed using pip.
+
+### Dependencies & Extras
+
+The package defines several dependency groups (extras):
+
+* **`server`**: Installs all dependencies required to run the FastAPI server (FastAPI, Uvicorn, Google GenAI SDK, document processing libraries, DuckDB, etc.).
+* **`pymupdf`**: Installs `pymupdf4llm` if you wish to use it as a PDF backend for the server's synchronous `/convert` endpoint. This is optional and an alternative to the default Gemini backend.
+* The **client** part of the package has minimal dependencies (`httpx`, `pydantic`), which are always installed.
+
+### 1. Server Setup
+
+**Prerequisites:**
+
+* Python 3.10+
+* Pip
+
+**Steps:**
+
+1. Clone the repository:
+
+   ```bash
+   git clone https://github.com/altaidevorg/llm-food.git
+   cd llm-food
+   ```
+
+2. Create and activate a virtual environment (recommended):
+
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
+
+3. Install the package with server dependencies:
+
+   ```bash
+   pip install .[server]
+   ```
+
+   If you also want to use `pymupdf4llm` as a PDF backend option for the `/convert` endpoint:
+
+   ```bash
+   pip install .[server,pymupdf]
+   ```
+
+4. **Configure Server:** Set up your environment variables by creating a `.env` file in the project root (you can copy `.env.sample` provided in the repository and fill it). See the "Server Configuration" section below for details on variables.
+   * **Crucial for `/batch`**: Ensure `GCS_BUCKET`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` are correctly set. If running locally and using a service account, also set `GOOGLE_APPLICATION_CREDENTIALS` pointing to a valid service account key JSON file.
+
+5. Run the FastAPI server:
+
+   ```bash
+   llm-food-serve
+   ```
+
+   The server will start, typically on `http://0.0.0.0:8000`. The API documentation (Swagger UI) will be available at `/docs`.
+   You can also configure host, port, and reload options via environment variables:
+   * `LLM_FOOD_HOST` (default: `0.0.0.0`)
+   * `LLM_FOOD_PORT` (default: `8000`)
+   * `LLM_FOOD_RELOAD` (default: `false`, set to `true` for development)
+
+### 2. Client & CLI Usage
+
+**Prerequisites:**
+
+* Python 3.10+
+* Pip
+* A running `llm-food` server.
+
+**Installation:**
+
+1. If you've already installed the server in an environment, the client and CLI are also available.
+2. To install only the client and CLI (e.g., on a different machine):
+
+   ```bash
+   pip install llm-food  # (Once published to PyPI)
+   # Or, from a cloned repository:
+   # pip install .
+   ```
+
+**CLI Usage:**
+
+The CLI interacts with a running `llm-food` server.
+
+* **Configure Server URL and Token (Optional):**
+  * Set environment variables:
+    * `LLM_FOOD_SERVER_URL`: URL of the llm-food server (default: `http://localhost:8000`).
+    * `LLM_FOOD_API_TOKEN`: API token if the server requires authentication.
+  * Or use CLI options: `--server-url` and `--token`.
+
+* **Commands:**
+
+  ```bash
+  # Convert a local file
+  llm-food convert-file /path/to/your/document.pdf
+
+  # Convert content from a URL
+  llm-food convert-url "http://example.com/article.html"
+
+  # Create a batch job (upload multiple files)
+  llm-food batch-create --output-gcs-path gs://your-bucket/outputs/ /path/to/file1.docx /path/to/file2.pdf
+
+  # Get the status of a batch job
+  llm-food batch-status <your_task_id>
+
+  # Get help
+  llm-food --help
+  llm-food convert-file --help
+  ```
+
+**Python Client Usage (Programmatic):**
+
+```python
+import asyncio
+from llm_food.client import LLMFoodClient, LLMFoodClientError
+
+async def main():
+    client = LLMFoodClient(base_url="http://localhost:8000", api_token="your-optional-token")
+
+    try:
+        # Convert a local file
+        conversion_response = await client.convert_file("path/to/your/file.docx")
+        print("Converted File:")
+        print(f"  Filename: {conversion_response.filename}")
+        print(f"  Content Hash: {conversion_response.content_hash}")
+        # print(f"  Texts: {conversion_response.texts}") # Can be long
+
+        # Convert from URL
+        url_response = await client.convert_url("https://www.example.com")
+        print("\nConverted URL:")
+        print(f"  Filename: {url_response.filename}")
+
+        # Create a batch job
+        batch_job = await client.create_batch_job(
+            file_paths=["path/to/report.pdf", "path/to/notes.docx"],
+            output_gcs_path="gs://your-gcs-bucket/batch_outputs/"
+        )
+        task_id = batch_job["task_id"]
+        print(f"\nBatch job created with Task ID: {task_id}")
+
+        # Poll for batch job status (example, implement more robust polling)
+        # await asyncio.sleep(10) # Give server time to process
+        # batch_status = await client.get_batch_job_status(task_id)
+        # print(f"\nBatch Job Status ({task_id}): {batch_status.status}")
+        # if batch_status.outputs:
+        #     print("Outputs:")
+        #     for item in batch_status.outputs:
+        #         print(f"  - {item.original_filename}: {item.gcs_output_uri}")
+
+    except LLMFoodClientError as e:
+        print(f"Client Error: {e}")
+    except FileNotFoundError as e:
+        print(f"File Error: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### 3. Using Docker (Server Deployment)
+
+**Prerequisites:**
+
+* Docker installed and running.
+
+**Steps:**
+
+1. Clone the repository.
+2. **Configure Server:** Create a `.env` file in the project root with your server configuration (see "Server Configuration" section). This file will be used by the Docker container.
+   * **Important for GCS/Gemini:** If `GOOGLE_APPLICATION_CREDENTIALS` is used in your `.env` file and points to a local path, you'll need to mount this file into the container and ensure the path in `.env` matches the path *inside* the container. For cloud deployments, prefer service accounts or workload identity.
+3. Build the Docker image:
+
+   ```bash
+   docker build -t llm-food .
+   ```
+
+4. Run the Docker container:
+
+   ```bash
+   # Example: Mount a local directory for DuckDB persistence and provide .env file
+   docker run -d -p 8000:8000 \
+     --name llm-food-container \
+     --env-file .env \
+     # Example for DuckDB persistence (ensure DUCKDB_FILE in .env is like ./data/batch_tasks.duckdb)
+     # -v $(pwd)/data:/app/data \
+     # Example for mounting service account key if GOOGLE_APPLICATION_CREDENTIALS=/app/secrets/gcp-key.json in .env
+     # -v /path/to/your/local/gcp-key.json:/app/secrets/gcp-key.json:ro \
+     llm-food
+   ```
+
+   * The server will be available on port 8000 of your Docker host.
+
+## Server API Endpoints
 
 * `POST /convert` (File Upload):
-  * Synchronously converts an uploaded file to Markdown.
+  * Synchronously converts an uploaded file. The server uses its configured `PDF_BACKEND` for PDFs.
   * Request: `multipart/form-data` with a `file` field.
   * Response: JSON with `filename`, `content_hash`, and `texts` (list of Markdown strings, one per page/section).
 * `GET /convert` (URL Conversion):
@@ -65,154 +260,81 @@ The service supports:
   * Retrieves the Markdown output for successfully processed files from a completed batch job.
   * Response: JSON containing the job status, a list of successfully converted files (with their original filename, GCS output URI, and Markdown content), and a list of any errors encountered for specific files.
 
-## Configuration
+## Server Configuration (Environment Variables)
 
-The service is configured using environment variables. Create a `.env` file in the project root (you can copy `.env.sample`) or set these variables in your deployment environment.
+The server is configured using environment variables. Create a `.env` file in the project root (you can copy `.env.sample` from the repository) or set these variables in your deployment environment.
 
 ```env
-# .env.sample content:
+# .env.sample content (illustrative, refer to .env.sample in repo for full list)
 
-# --- General Configuration ---
-# API Authentication Bearer Token (Optional. If set, all endpoints will require this token)
-# Example: API_AUTH_TOKEN=your-secret-bearer-token
+# --- General Server Configuration ---
+# API Authentication Bearer Token (Optional. If set, all server endpoints will require this token)
 API_AUTH_TOKEN=
-
 # Maximum file size for uploads in Megabytes (Optional, for POST /convert)
-# Example: MAX_FILE_SIZE_MB=50
-MAX_FILE_SIZE_MB=
+MAX_FILE_SIZE_MB=50
 
-# --- PDF Processing Configuration ---
-# Backend for PDF processing in POST /convert: 'gemini' (default), 'pymupdf4llm', or 'pypdf2'
+# --- PDF Processing Configuration (for POST /convert endpoint on the server) ---
+# Backend for PDF processing: 'gemini' (default), 'pymupdf4llm', or 'pypdf2'
 PDF_BACKEND=gemini
 
 # --- Google Cloud & Gemini Configuration (Required for /batch PDF processing and /convert with PDF_BACKEND='gemini') ---
-# Your Google Cloud Project ID
 GOOGLE_CLOUD_PROJECT=your-gcp-project-id
-
-# Google Cloud Location (e.g., us-central1, europe-west1) - Required for Gemini Vertex AI client
-GOOGLE_CLOUD_LOCATION=us-central1
-
-# GCS Bucket for temporary files for /batch PDF processing (e.g., page images, payload.jsonl) AND final outputs from /batch
-# Ensure the service account has read/write access to this bucket.
-# Example: GCS_BUCKET=your-llm-food-bucket
-GCS_BUCKET=
-
-# Path to Google Cloud service account JSON file (Optional, for local GCS/Gemini access if not using ADC)
-# Example: GOOGLE_APPLICATION_CREDENTIALS=/path/to/your/service-account-file.json
-GOOGLE_APPLICATION_CREDENTIALS=
-
-# Gemini Model for Vision (used by /batch for PDF OCR via Gemini Batch API, and by POST /convert if PDF_BACKEND='gemini')
-# Example: GEMINI_MODEL_FOR_VISION=gemini-2.0-flash-001
+GOOGLE_CLOUD_LOCATION=us-central1 # e.g., us-central1, europe-west1
+GCS_BUCKET=your-llm-food-bucket # For temporary files and batch outputs
+GOOGLE_APPLICATION_CREDENTIALS= # Path to service account JSON for local/non-GCP environments
 GEMINI_MODEL_FOR_VISION=gemini-2.0-flash-001
-
-# Custom OCR Prompt for Gemini (Optional)
 # GEMINI_OCR_PROMPT="Your custom OCR prompt here..."
 
-# --- DuckDB Configuration ---
-# Path to the DuckDB database file (will be created if it doesn't exist)
-# Example: DUCKDB_FILE=./data/batch_tasks.duckdb
-DUCKDB_FILE=batch_tasks.duckdb
+# --- DuckDB Configuration (Server-side) ---
+DUCKDB_FILE=batch_tasks.duckdb # Path to the DuckDB database file
+
+# --- Server Uvicorn Configuration (Optional) ---
+# LLM_FOOD_HOST=0.0.0.0
+# LLM_FOOD_PORT=8000
+# LLM_FOOD_RELOAD=false # Set to true for development (server auto-restarts on code changes)
 ```
 
 **Key Variables Explained:**
 
-* `API_AUTH_TOKEN`: If set, secures all API endpoints.
-* `MAX_FILE_SIZE_MB`: Limit for single file uploads to `/convert`.
-* `PDF_BACKEND`: For the synchronous `/convert` endpoint when processing PDFs. Does not affect `/batch` PDF processing, which always uses Gemini Batch API.
+* `API_AUTH_TOKEN`: If set, secures all server API endpoints.
+* `MAX_FILE_SIZE_MB`: Limit for single file uploads to the server's `/convert` endpoint.
+* `PDF_BACKEND`: For the server's synchronous `/convert` endpoint when processing PDFs. Does not affect `/batch` PDF processing, which always uses Gemini Batch API.
 * `GOOGLE_CLOUD_PROJECT`: Essential for all GCS operations and Gemini Vertex AI.
 * `GOOGLE_CLOUD_LOCATION`: Region for Gemini Vertex AI client.
-* `GCS_BUCKET`: **Crucial for `/batch` operations.** This single bucket is used for:
-  * Storing temporary intermediate files for PDF batch processing (page images, `payload.jsonl`).
-  * The `output_gcs_path` provided in the `/batch` request will also typically be a path *within* this bucket (e.g., `gs://YOUR_GCS_BUCKET/final_markdowns/`). Ensure the service account has appropriate permissions (Storage Object Admin on this bucket is recommended).
+* `GCS_BUCKET`: **Crucial for `/batch` operations.** This single bucket is used by the server for:
+  * Storing temporary intermediate files for PDF batch processing.
+  * The `output_gcs_path` provided in the `/batch` request will also typically be a path *within* this bucket.
 * `GOOGLE_APPLICATION_CREDENTIALS`: For local development or non-GCP environments to authenticate GCS and Gemini calls.
-Gemini model used for OCR. The `/batch` endpoint uses this for batch predictions, and it's also used by the `POST /convert` endpoint if `PDF_BACKEND` is 'gemini'.
+* `GEMINI_MODEL_FOR_VISION`: Gemini model used for OCR.
 * `GEMINI_OCR_PROMPT`: Allows customization of the prompt sent to Gemini for OCR tasks.
-* `DUCKDB_FILE`: Path where the DuckDB database file for task tracking will be stored.
-
-## Setup and Running
-
-### 1. Local Development (without Docker)
-
-**Prerequisites:**
-
-* Python 3.10+
-* Pip
-
-**Steps:**
-
-1. Clone the repository.
-2. Create and activate a virtual environment:
-
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows: venv\Scripts\activate
-    ```
-
-3. Install dependencies:
-
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-4. Set up your environment variables by creating a `.env` file (copy `.env.sample` and fill it).
-    * **Crucial for `/batch`**: Ensure `GCS_BUCKET`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` are correctly set. If running locally, also set `GOOGLE_APPLICATION_CREDENTIALS` pointing to a valid service account key JSON file with permissions for GCS (read/write to `GCS_BUCKET`) and Vertex AI (e.g., Vertex AI User role).
-5. Run the FastAPI application using Uvicorn:
-
-    ```bash
-    uvicorn main:app --reload
-    ```
-
-    The API will be available at `http://127.0.0.1:8000` (Swagger UI at `/docs`).
-
-### 2. Using Docker
-
-**Prerequisites:**
-
-* Docker installed and running.
-
-**Steps:**
-
-1. Clone the repository.
-2. Create a `.env` file in the project root with your configuration.
-3. Build the Docker image:
-
-    ```bash
-    docker build -t llm-food .
-    ```
-
-4. Run the Docker container:
-
-    ```bash
-    # Example: Mount a local directory for DuckDB persistence and provide .env file
-    docker run -d -p 8000:8000 \
-      --name llm-food-container \
-      --env-file .env \
-      -v $(pwd)/data:/app/data \
-      llm-food
-    ```
-
-    * Ensure your `.env` file includes `DUCKDB_FILE=./data/batch_tasks.duckdb` if using the volume mount example above.
-    * If `GOOGLE_APPLICATION_CREDENTIALS` is used in `.env`, ensure the path to the service account key is accessible within the container (e.g., by mounting it as a volume and adjusting the path in `.env`).
+* `DUCKDB_FILE`: Path where the DuckDB database file for task tracking will be stored by the server.
 
 ## Authentication
 
-If the `API_AUTH_TOKEN` environment variable is set, all API endpoints will be protected. Clients must include an `Authorization` header with a Bearer token:
-`Authorization: Bearer your-secret-bearer-token`
+If the `API_AUTH_TOKEN` environment variable is set on the server, all its API endpoints will be protected.
+Clients (Python client or CLI) must then provide this token.
 
-If the token is not set, the API is accessible without authentication.
+* **CLI:** Use the `--token` option or `LLM_FOOD_API_TOKEN` environment variable.
+* **Python Client:** Pass the `api_token` argument to the `LLMFoodClient` constructor.
+
+If the token is not set on the server, the API is accessible without authentication.
 
 ## License Considerations
- **Gemini:** PDF processing via Gemini uses Google's Generative AI SDK. Review Google's terms of service.
-* **Alternative PDF Backends (for `/convert`):**
-  * `pymupdf4llm`: Licensed under AGPLv3.
+
+* **Core Package:** MIT License (refer to `pyproject.toml`).
+* **Gemini:** PDF processing via Gemini uses Google's Generative AI SDK. Review Google's terms of service.
+* **Alternative PDF Backends (for server's `/convert`):**
+  * `pymupdf4llm`: Licensed under AGPLv3. (Optional dependency)
   * `pypdf2` (via `pypdf`): Typically uses permissive licenses (MIT/BSD).
 * **DuckDB:** MIT licensed.
 
-## Notes on Batch PDF Processing with Gemini
+Ensure compliance with all relevant licenses for the components you use.
 
-* The `/batch` endpoint, when processing PDFs, converts each page to a PNG image.
-* These images are temporarily uploaded to a folder within your `GCS_BUCKET` (specifically under `gemini_batch_jobs/{main_task_id}/{sub_task_id}/inputs/images/`).
+## Notes on Batch PDF Processing with Gemini (Server Logic)
+
+* The server's `/batch` endpoint, when processing PDFs, converts each page to a PNG image.
+* These images are temporarily uploaded by the server to a folder within your `GCS_BUCKET`.
 * A `payload.jsonl` file referencing these GCS image URIs is created and also uploaded to `GCS_BUCKET`.
-* A Gemini Batch Prediction job is then submitted. Results are written by Gemini to an output folder within `GCS_BUCKET` (under `gemini_batch_jobs/{main_task_id}/{sub_task_id}/outputs/`).
-* The application polls this job, and upon success, parses the results, aggregates Markdown for each PDF, and saves the final `.md` files to the `output_gcs_path` you specified in the `/batch` request.
-* Consider GCS lifecycle policies for the `gemini_batch_jobs/` prefix in your `GCS_BUCKET` to manage/delete temporary image and payload files after a certain period to control costs.
+* A Gemini Batch Prediction job is then submitted by the server.
+* The server polls this job, and upon success, parses results, aggregates Markdown, and saves final `.md` files to the `output_gcs_path` specified in the `/batch` request.
+* Consider GCS lifecycle policies for temporary file prefixes in your `GCS_BUCKET` to manage costs.
