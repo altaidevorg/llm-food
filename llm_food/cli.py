@@ -368,7 +368,7 @@ async def main_async():
                     if error_item.error_message:
                         print(f"    Error: {error_item.error_message}")
             else:
-                print("No specific file errors reported by this endpoint.")
+                print("No errors reported for this job.")
 
     except LLMFoodClientError as e:
         print(
