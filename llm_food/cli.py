@@ -81,6 +81,12 @@ async def main_async():
         help="Get the detailed status of a batch job from the server.",
     )
     parser_batch_status.add_argument("task_id", type=str, help="ID of the batch task")
+    parser_batch_status.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print detailed sub-job and individual file task statuses.",
+    )
 
     # Batch results command - NEW
     parser_batch_results = subparsers.add_parser(
@@ -150,60 +156,70 @@ async def main_async():
             print(f"  Processed Count: {detailed_status.overall_processed_count}")
             print(f"  Failed Count: {detailed_status.overall_failed_count}")
             print(f"  Last Updated At: {detailed_status.last_updated_at}")
-            print("---")
 
-            if detailed_status.gemini_pdf_processing_details:
-                print(
-                    f"Gemini PDF Processing Details ({len(detailed_status.gemini_pdf_processing_details)} sub-job(s)):"
-                )
-                for gemini_job in detailed_status.gemini_pdf_processing_details:
+            if args.verbose:
+                print("---")
+                if detailed_status.gemini_pdf_processing_details:
                     print(
-                        f"  - Gemini Sub Job ID: {gemini_job.gemini_batch_sub_job_id}"
+                        f"Gemini PDF Processing Details ({len(detailed_status.gemini_pdf_processing_details)} sub-job(s)):"
                     )
-                    print(
-                        f"    Gemini API Job Name: {gemini_job.gemini_api_job_name or 'N/A'}"
-                    )
-                    print(f"    Status: {gemini_job.status}")
-                    print(f"    Payload GCS URI: {gemini_job.payload_gcs_uri or 'N/A'}")
-                    print(
-                        f"    Gemini Output GCS Prefix: {gemini_job.gemini_output_gcs_uri_prefix or 'N/A'}"
-                    )
-                    print(
-                        f"    Total PDF Pages: {gemini_job.total_pdf_pages_for_batch}"
-                    )
-                    print(
-                        f"    Processed PDF Pages: {gemini_job.processed_pdf_pages_count}"
-                    )
-                    print(f"    Failed PDF Pages: {gemini_job.failed_pdf_pages_count}")
-                    if gemini_job.error_message:
-                        print(f"    Error Message: {gemini_job.error_message}")
-            else:
-                print("No Gemini PDF processing sub-jobs found.")
-            print("---")
-
-            if detailed_status.file_processing_details:
-                print(
-                    f"Individual File Processing Details ({len(detailed_status.file_processing_details)} tasks):"
-                )
-                for file_task in detailed_status.file_processing_details:
-                    page_info = (
-                        f" (Page: {file_task.page_number})"
-                        if file_task.page_number is not None
-                        else ""
-                    )
-                    print(
-                        f"  - Original Filename: {file_task.original_filename}{page_info}"
-                    )
-                    print(f"    File Type: {file_task.file_type}")
-                    print(f"    Status: {file_task.status}")
-                    if file_task.gcs_output_markdown_uri:
+                    for gemini_job in detailed_status.gemini_pdf_processing_details:
                         print(
-                            f"    GCS Output URI (final/aggregated): {file_task.gcs_output_markdown_uri}"
+                            f"  - Gemini Sub Job ID: {gemini_job.gemini_batch_sub_job_id}"
                         )
-                    if file_task.error_message:
-                        print(f"    Error: {file_task.error_message}")
+                        print(
+                            f"    Gemini API Job Name: {gemini_job.gemini_api_job_name or 'N/A'}"
+                        )
+                        print(f"    Status: {gemini_job.status}")
+                        print(
+                            f"    Payload GCS URI: {gemini_job.payload_gcs_uri or 'N/A'}"
+                        )
+                        print(
+                            f"    Gemini Output GCS Prefix: {gemini_job.gemini_output_gcs_uri_prefix or 'N/A'}"
+                        )
+                        print(
+                            f"    Total PDF Pages: {gemini_job.total_pdf_pages_for_batch}"
+                        )
+                        print(
+                            f"    Processed PDF Pages: {gemini_job.processed_pdf_pages_count}"
+                        )
+                        print(
+                            f"    Failed PDF Pages: {gemini_job.failed_pdf_pages_count}"
+                        )
+                        if gemini_job.error_message:
+                            print(f"    Error Message: {gemini_job.error_message}")
+                else:
+                    print("No Gemini PDF processing sub-jobs found.")
+                print("---")
+
+                if detailed_status.file_processing_details:
+                    print(
+                        f"Individual File Processing Details ({len(detailed_status.file_processing_details)} tasks):"
+                    )
+                    for file_task in detailed_status.file_processing_details:
+                        page_info = (
+                            f" (Page: {file_task.page_number})"
+                            if file_task.page_number is not None
+                            else ""
+                        )
+                        print(
+                            f"  - Original Filename: {file_task.original_filename}{page_info}"
+                        )
+                        print(f"    File Type: {file_task.file_type}")
+                        print(f"    Status: {file_task.status}")
+                        if file_task.gcs_output_markdown_uri:
+                            print(
+                                f"    GCS Output URI (final/aggregated): {file_task.gcs_output_markdown_uri}"
+                            )
+                        if file_task.error_message:
+                            print(f"    Error: {file_task.error_message}")
+                else:
+                    print("No individual file processing tasks found.")
             else:
-                print("No individual file processing tasks found.")
+                print("---")
+            print(
+                "Run with --verbose to see detailed sub-job and individual file task statuses."
+            )
 
         elif args.command == "batch-results":
             # This command fetches and optionally saves results from /batch/{task_id}
