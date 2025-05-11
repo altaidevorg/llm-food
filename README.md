@@ -4,6 +4,10 @@
 
 ![LOGO](./assets//logo.png)
 
+[Blog Post](https://altai.dev/blog/introducing-llm-food)
+
+[PyPi](https://pypi.org/project/llm-food)
+
 ---
 
 ## Overview
