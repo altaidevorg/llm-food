@@ -1,3 +1,7 @@
+# env
+.venv/
+env/
+
 # cache
 __pycache__/
 .ruff_cache
@@ -16,6 +20,7 @@ dist/
 *.pdf
 *.pptx
 *.rtf
+llm_food_outputs_*
 
 # db
 *.duckdb

@@ -10,7 +10,7 @@
 
 `llm-food` is a Python package that provides a FastAPI-based microservice (the **server**) for converting various input document formats into clean Markdown text. This output is optimized for downstream Large Language Model (LLM) pipelines, such as those used for Retrieval Augmented Generation (RAG) or fine-tuning.
 
-The package also includes a Python **client** library and a command-line interface (**CLI**) for easy interaction with the server.
+The package also includes a convenient Python **client** library and an ergonomic command-line interface (**CLI**) for easy interaction with the server.
 
 The server supports:
 
@@ -19,11 +19,20 @@ The server supports:
 * Asynchronous batch processing of multiple uploaded files (`/batch`), with PDFs leveraging Google's Gemini Batch API for efficient, scalable OCR and conversion. Other file types in the batch are processed individually.
 * Task status tracking and result retrieval for batch jobs using a local DuckDB database.
 
+## Motivation
+
+Extracting clean text from PDFs is still a mess. Tools like `dockling` and `marker` do a decent job—but they’re slow and resource-hungry. `pymupdf4llm` is fast, but it’s AGPL-licensed, which means you'd need to open-source everything that talks to it—even over the network.
+
+[**Gemini Batch Prediction**](https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/batch-prediction-gemini) gives you blazing throughput and unbeatable pricing—[**\$1 for 6,000 pages**](https://www.sergey.fyi/articles/gemini-flash-2).
+The catch? It’s a pain to use.
+
+That is, until now. We wrapped it up in a few friendly CLI commands—simple enough for your grandparents to enjoy.
+
 ## Features
 
 * **Multiple Format Support:** Convert PDF, DOC/DOCX, RTF, PPTX, and HTML/webpages to Markdown.
 * **Advanced PDF Processing (Synchronous Server):** The server's `/convert` endpoint can use Google's Gemini model for high-quality OCR of single PDFs, with alternative backends (`pymupdf4llm`, `pypdf2`) available via server configuration.
-* **Scalable Batch PDF Processing (Server):** The server's `/batch` endpoint uses Google's Gemini Batch Prediction API for efficient and potentially cost-effective conversion of multiple PDFs.
+* **Scalable Batch PDF Processing (Server):** The server's `/batch` endpoint uses Google's Gemini Batch Prediction API for high-throughput and extremely cost-friendly conversion of multiple PDFs.
 * **Batch Processing for Other Formats (Server):** Non-PDF files uploaded to `/batch` (DOCX, RTF, PPTX, HTML) are processed individually as background tasks on the server.
 * **Asynchronous Operations (Server):** All batch processing tasks are handled asynchronously by the server.
 * **Task Management with DuckDB (Server):** Batch job progress, individual file statuses, and GCS output locations are tracked in a local DuckDB database on the server.
@@ -73,6 +82,10 @@ The package defines several dependency groups (extras):
    cd llm-food
    ```
 
+**Love yourself**: `uv sync`
+
+  **Masochist?** Here's the the pip version:
+
 2. Create and activate a virtual environment (recommended):
 
    ```bash
@@ -121,6 +134,8 @@ The package defines several dependency groups (extras):
 2. To install only the client and CLI (e.g., on a different machine):
 
    ```bash
+   uv add llm-food
+   # or
    pip install llm-food
    # Or, from a cloned repository:
    # pip install .
@@ -146,10 +161,13 @@ The CLI interacts with a running `llm-food` server.
   llm-food convert-url "http://example.com/article.html"
 
   # Create a batch job (upload multiple files)
-  llm-food batch-create --output-gcs-path gs://your-bucket/outputs/ /path/to/file1.docx /path/to/file2.pdf
+  llm-food batch-create /path/to/file1.docx /path/to/file2.pdf gs://your-bucket/outputs/
 
   # Get the status of a batch job
   llm-food batch-status <your_task_id>
+
+  # get the results in Markdown
+  llm-food batch-results <your_task_id>
 
   # Get help
   llm-food --help
@@ -321,7 +339,7 @@ If the token is not set on the server, the API is accessible without authenticat
 
 ## License Considerations
 
-* **Core Package:** MIT License (refer to `pyproject.toml`).
+* **Core Package:** MIT License.
 * **Gemini:** PDF processing via Gemini uses Google's Generative AI SDK. Review Google's terms of service.
 * **Alternative PDF Backends (for server's `/convert`):**
   * `pymupdf4llm`: Licensed under AGPLv3. (Optional dependency)

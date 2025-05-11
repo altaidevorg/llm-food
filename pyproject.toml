@@ -1,7 +1,7 @@
 [project]
 name = "llm-food"
-version = "0.1.0"
-keywords = ["llm-food", "pdf-to-markdown", "text-extraction", "rag"]
+version = "0.1.1"
+keywords = ["llm-food", "pdf-to-markdown", "text-extraction", "rag", "llm"]
 authors = [
     { name = "Yusuf Sarıgöz", email = "yusufsarigoz@gmail.com"}
 ]

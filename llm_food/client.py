@@ -9,6 +9,7 @@ import os
 from .models import (
     ConversionResponse,
     BatchJobOutputResponse,
+    BatchJobStatusResponse,
 )
 
 
@@ -170,8 +171,8 @@ class LLMFoodClient:
                 if not f_obj.closed:
                     f_obj.close()
 
-    async def get_batch_job_status(self, task_id: str) -> BatchJobOutputResponse:
-        """Retrieves the status and results of a batch job."""
+    async def get_batch_job_results(self, task_id: str) -> BatchJobOutputResponse:
+        """Retrieves the results (outputs and errors) of a batch job from /batch/{task_id}."""
         endpoint = f"/batch/{task_id}"
         try:
             response = await self._request("GET", endpoint)
@@ -180,5 +181,20 @@ class LLMFoodClient:
             raise
         except Exception as e:
             raise LLMFoodClientError(
-                f"Error retrieving batch job status ({task_id}): {str(e)}"
+                f"Error retrieving batch job results ({task_id}): {str(e)}"
+            )
+
+    async def get_detailed_batch_job_status(
+        self, task_id: str
+    ) -> BatchJobStatusResponse:
+        """Retrieves the detailed status of a batch job from /status/{task_id}."""
+        endpoint = f"/status/{task_id}"
+        try:
+            response = await self._request("GET", endpoint)
+            return BatchJobStatusResponse(**response.json())
+        except LLMFoodClientError:  # Re-raise client errors
+            raise
+        except Exception as e:
+            raise LLMFoodClientError(
+                f"Error retrieving detailed batch job status ({task_id}): {str(e)}"
             )
