@@ -16,6 +16,7 @@ dist/
 *.pdf
 *.pptx
 *.rtf
+llm_food_outputs_*
 
 # db
 *.duckdb
