@@ -7,7 +7,6 @@ import sys
 import json
 from typing import Optional
 
-# Assuming client.py is in the same package
 from .client import LLMFoodClient, LLMFoodClientError
 
 # Default server URL, can be overridden by env var or CLI arg
@@ -66,9 +65,15 @@ async def main_async():
 
     # Batch status command
     parser_batch_status = subparsers.add_parser(
-        "batch-status", help="Get the status of a batch job"
+        "batch-status", help="Get the status of a batch job and optionally save results"
     )
     parser_batch_status.add_argument("task_id", type=str, help="ID of the batch task")
+    parser_batch_status.add_argument(
+        "--save-dir",
+        type=str,
+        help="Directory to save successful Markdown outputs. Files will be named based on original filenames.",
+        default=None,
+    )
 
     args = parser.parse_args()
 
@@ -88,7 +93,60 @@ async def main_async():
             print(json.dumps(result, indent=2))  # server returns a dict directly
         elif args.command == "batch-status":
             result = await client.get_batch_job_status(args.task_id)
-            print(json.dumps(result.model_dump(), indent=2))
+
+            print(f"Batch Job Status for Task ID: {result.job_id}")
+            print(f"Overall Status: {result.status}")
+            if result.message:
+                print(f"Message: {result.message}")
+            print("---")
+
+            if result.outputs:
+                print(f"Successful Outputs ({len(result.outputs)}):")
+                for item in result.outputs:
+                    print(f"  - Original Filename: {item.original_filename}")
+                    print(f"    GCS Output URI: {item.gcs_output_uri}")
+                    if args.save_dir:
+                        if not os.path.exists(args.save_dir):
+                            os.makedirs(args.save_dir)
+                            print(f"    Created directory: {args.save_dir}")
+
+                        # Sanitize filename slightly - replace potential path separators from original_filename
+                        # and ensure it ends with .md
+                        base_name = os.path.basename(item.original_filename)
+                        file_name_stem = os.path.splitext(base_name)[0]
+                        output_filename = f"{file_name_stem}.md"
+                        output_path = os.path.join(args.save_dir, output_filename)
+
+                        try:
+                            with open(output_path, "w", encoding="utf-8") as f:
+                                f.write(item.markdown_content)
+                            print(f"    Saved content to: {output_path}")
+                        except IOError as e:
+                            print(f"    Error saving file {output_path}: {e}")
+            else:
+                print(
+                    "No successful outputs found for this job yet (or job did not produce any)."
+                )
+
+            print("---")
+            if result.errors:
+                print(f"Errors Encountered ({len(result.errors)}):")
+                for error_item in result.errors:
+                    page_info = (
+                        f" (Page: {error_item.page_number})"
+                        if error_item.page_number is not None
+                        else ""
+                    )
+                    print(f"  - Original Filename: {error_item.original_filename}")
+                    print(f"    File Type: {error_item.file_type}{page_info}")
+                    print(f"    Status: {error_item.status}")
+                    if error_item.error_message:
+                        print(f"    Error: {error_item.error_message}")
+            else:
+                print("No errors reported for this job.")
+
+            # Original JSON dump can be useful for debugging, optionally keep it or remove
+            # print(json.dumps(result.model_dump(), indent=2))
     except LLMFoodClientError as e:
         print(
             f"Client Error: {e}",

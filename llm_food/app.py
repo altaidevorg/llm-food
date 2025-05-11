@@ -50,6 +50,7 @@ from .models import (
     BatchJobOutputResponse,
     BatchOutputItem,
     ConversionResponse,
+    BatchJobStatusResponse,
 )
 
 # --- Conditional imports based on the PDF backend ---
@@ -372,50 +373,45 @@ async def convert_url(
     )
 
 
-@app.get("/status/{task_id}", dependencies=[Depends(authenticate_request)])
+@app.get(
+    "/status/{task_id}",
+    response_model=BatchJobStatusResponse,
+    dependencies=[Depends(authenticate_request)],
+)
 def status(task_id: str):
-    # This will be updated to query DuckDB for batch jobs
-    # For now, keep the old behavior for non-batch tasks if any, or return not found.
-    # If task_id looks like a UUID, it might be an old task.
-    # A more robust solution would be to prefix batch task_ids or check DB first.
     con = get_db_connection()
     try:
-        job_status = con.execute(
+        job_status_row = con.execute(
             "SELECT * FROM batch_jobs WHERE job_id = ?", (task_id,)
         ).fetchone()
-        if job_status:
-            # Fetch details from other tables as well
-            job_dict = dict(zip([desc[0] for desc in con.description], job_status))
 
-            # Fetch gemini sub job details if any
-            gemini_sub_jobs = con.execute(
-                "SELECT * FROM gemini_pdf_batch_sub_jobs WHERE batch_job_id = ?",
-                (task_id,),
-            ).fetchall()
-            job_dict["gemini_pdf_processing_details"] = [
-                dict(zip([desc[0] for desc in con.description], sub_job))
-                for sub_job in gemini_sub_jobs
-            ]
-
-            # Fetch individual file task details
-            file_tasks_details = con.execute(
-                "SELECT original_filename, file_type, status, gcs_output_markdown_uri, error_message, page_number FROM file_tasks WHERE batch_job_id = ?",
-                (task_id,),
-            ).fetchall()
-            job_dict["file_processing_details"] = [
-                dict(zip([desc[0] for desc in con.description], task))
-                for task in file_tasks_details
-            ]
-
-            return job_dict
-        else:  # Fallback to old TASKS dict or not found
-            return TASKS.get(
-                task_id,
-                {
-                    "status": "not_found",
-                    "detail": "Task not found in active batch jobs or older task system.",
-                },
+        if not job_status_row:
+            raise HTTPException(
+                status_code=404, detail=f"Batch job with ID {task_id} not found."
             )
+
+        job_dict = dict(zip([desc[0] for desc in con.description], job_status_row))
+
+        gemini_sub_jobs_rows = con.execute(
+            "SELECT * FROM gemini_pdf_batch_sub_jobs WHERE batch_job_id = ?",
+            (task_id,),
+        ).fetchall()
+        job_dict["gemini_pdf_processing_details"] = [
+            dict(zip([desc[0] for desc in con.description], sub_job_row))
+            for sub_job_row in gemini_sub_jobs_rows
+        ]
+
+        file_tasks_rows = con.execute(
+            "SELECT original_filename, file_type, status, gcs_output_markdown_uri, error_message, page_number FROM file_tasks WHERE batch_job_id = ?",
+            (task_id,),
+        ).fetchall()
+        job_dict["file_processing_details"] = [
+            dict(zip([desc[0] for desc in con.description], task_row))
+            for task_row in file_tasks_rows
+        ]
+
+        # Pydantic will validate the structure of job_dict against BatchJobStatusResponse
+        return job_dict
     finally:
         con.close()
 
