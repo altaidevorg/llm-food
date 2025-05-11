@@ -321,7 +321,7 @@ If the token is not set on the server, the API is accessible without authenticat
 
 ## License Considerations
 
-* **Core Package:** MIT License (refer to `pyproject.toml`).
+* **Core Package:** MIT License.
 * **Gemini:** PDF processing via Gemini uses Google's Generative AI SDK. Review Google's terms of service.
 * **Alternative PDF Backends (for server's `/convert`):**
   * `pymupdf4llm`: Licensed under AGPLv3. (Optional dependency)

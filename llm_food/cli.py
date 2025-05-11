@@ -6,9 +6,12 @@ import os
 import sys
 import json
 from typing import Optional
+from pathlib import Path
 
 from .client import LLMFoodClient, LLMFoodClientError
 from .models import BatchJobStatusResponse
+
+SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".rtf", ".pptx", ".html", ".htm"]
 
 # Default server URL, can be overridden by env var or CLI arg
 DEFAULT_SERVER_URL = "http://localhost:8000"
@@ -138,8 +141,91 @@ async def main_async():
             else:
                 print(json.dumps(result.model_dump(), indent=2))
         elif args.command == "batch-create":
+            files_to_process = []
+            has_errors = False
+
+            for path_str in args.file_paths:
+                input_path = Path(path_str)
+                if not input_path.exists():
+                    print(
+                        f"Error: Path does not exist: {path_str}",
+                        file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                    )
+                    has_errors = True
+                    continue  # Continue to check other paths but mark that an error occurred
+
+                if input_path.is_file():
+                    if input_path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                        files_to_process.append(
+                            str(input_path.resolve())
+                        )  # Use absolute path
+                    else:
+                        print(
+                            f"Warning: File skipped (unsupported extension): {path_str}",
+                            file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                        )
+                elif input_path.is_dir():
+                    print(f"Processing directory: {path_str}")
+                    found_in_dir = False
+                    for ext in SUPPORTED_EXTENSIONS:
+                        for found_file in input_path.rglob(f"*{ext}"):
+                            if (
+                                found_file.is_file()
+                            ):  # Ensure it's a file, not a dir ending with .ext
+                                files_to_process.append(
+                                    str(found_file.resolve())
+                                )  # Use absolute path
+                                found_in_dir = True
+                    if not found_in_dir:
+                        print(
+                            f"Warning: No supported files found in directory: {path_str}",
+                            file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                        )
+                else:
+                    # This case should ideally not be reached if exists() and is_file()/is_dir() are comprehensive
+                    print(
+                        f"Error: Path is not a valid file or directory: {path_str}",
+                        file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                    )
+                    has_errors = True
+
+            if has_errors:
+                print(
+                    "Errors occurred while validating input paths. Aborting batch creation.",
+                    file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                )
+                exit(1)
+
+            if not files_to_process:
+                print(
+                    "Error: No supported files found to process. Batch creation aborted.",
+                    file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                )
+                exit(1)
+
+            # Deduplicate list while preserving order (Python 3.7+ for dict.fromkeys)
+            # For broader compatibility, set then list might reorder, but for file paths order might not be critical here.
+            # Using resolve() for absolute paths should help in deduplication if relative paths point to same file.
+            unique_files_to_process = sorted(
+                list(set(files_to_process))
+            )  # Sort for consistent ordering if duplicates existed
+
+            if not unique_files_to_process:
+                print(
+                    "Error: No supported files remained after deduplication. Batch creation aborted.",
+                    file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                )
+                exit(1)
+
+            print(
+                f"Found {len(unique_files_to_process)} unique supported file(s) to process for the batch job."
+            )
+            # Optionally print the list of files if verbose or for debugging
+            # for f_path in unique_files_to_process:
+            #     print(f"  - {f_path}")
+
             result = await client.create_batch_job(
-                args.file_paths, args.output_gcs_path
+                unique_files_to_process, args.output_gcs_path
             )
             print(json.dumps(result, indent=2))  # server returns a dict directly
         elif args.command == "batch-status":
