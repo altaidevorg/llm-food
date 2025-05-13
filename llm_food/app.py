@@ -99,7 +99,7 @@ async def authenticate_request(
                 detail="Invalid authentication scheme. Only Bearer is supported.",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        if credentials.token != configured_token:
+        if credentials.credentials != configured_token:
             raise HTTPException(
                 status_code=403,
                 detail="Invalid token.",
