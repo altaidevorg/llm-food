@@ -21,6 +21,7 @@ The server supports:
 * Synchronous single file processing via file upload (`/convert`).
 * Synchronous URL-to-Markdown conversion (`/convert?url=...`).
 * Asynchronous batch processing of multiple uploaded files (`/batch`), with PDFs leveraging Google's Gemini Batch API for efficient, scalable OCR and conversion. Other file types in the batch are processed individually.
+* Asynchronous batch processing for general text tasks via JSONL file upload (`/text-batch`).
 * Task status tracking and result retrieval for batch jobs using a local DuckDB database.
 
 ## Motivation
@@ -34,16 +35,17 @@ That is, until now. We wrapped it up in a few friendly CLI commands—simple eno
 
 ## Features
 
-* **Multiple Format Support:** Convert PDF, DOC/DOCX, RTF, PPTX, and HTML/webpages to Markdown.
+* **Multiple Format Support:** Convert PDF, DOC/DOCX, RTF, PPTX, and HTML/webpages to Markdown for document conversion tasks.
+* **General Text Batch Processing:** Process multiple text-based tasks (e.g., generation, translation, analysis) defined in a JSONL file. Each task can have system instructions and message history.
 * **Advanced PDF Processing (Synchronous Server):** The server's `/convert` endpoint can use Google's Gemini model for high-quality OCR of single PDFs, with alternative backends (`pymupdf4llm`, `pypdf2`) available via server configuration.
 * **Scalable Batch PDF Processing (Server):** The server's `/batch` endpoint uses Google's Gemini Batch Prediction API for high-throughput and extremely cost-friendly conversion of multiple PDFs.
 * **Batch Processing for Other Formats (Server):** Non-PDF files uploaded to `/batch` (DOCX, RTF, PPTX, HTML) are processed individually as background tasks on the server.
-* **Asynchronous Operations (Server):** All batch processing tasks are handled asynchronously by the server.
-* **Task Management with DuckDB (Server):** Batch job progress, individual file statuses, and GCS output locations are tracked in a local DuckDB database on the server.
-* **Status & Result Retrieval (Server):** API endpoints to check job status and retrieve results.
+* **Asynchronous Operations (Server):** All batch processing tasks (document conversion and general text batch) are handled asynchronously by the server.
+* **Task Management with DuckDB (Server):** Batch job progress, individual file statuses, and GCS output locations (for document conversion) or results (for text batch) are tracked in a local DuckDB database on the server.
+* **Status & Result Retrieval (Server):** API endpoints to check job status and retrieve results for all batch job types.
 * **Python Client & CLI:**
   * Programmatic access to all server endpoints via an `async` Python client.
-  * Command-line interface for easy interaction with the server (file conversion, batch jobs, status checks).
+  * Command-line interface for easy interaction with the server (file conversion, all batch job types, status checks).
 * **Configurable File Size Limit (Server):** Set a maximum size for uploaded files.
 * **Optional Authentication (Server):** Secure all server endpoints with a Bearer token.
 * **Dockerized Server:** Ready for containerized deployment.
@@ -57,6 +59,37 @@ That is, until now. We wrapped it up in a few friendly CLI commands—simple eno
 | RTF       | `striprtf`                                                     | Yes                      | Yes (individual background task)                                |
 | PPTX      | `python-pptx`                                                  | Yes                      | Yes (individual background task)                                |
 | HTML/URLs | `trafilatura`                                                  | Yes (file or URL)        | Yes (HTML files, individual background task)                  |
+| JSONL     | Custom (for text batch processing)                             | N/A                      | Yes (via `/text-batch` endpoint)                                |
+
+## General Text Batch Processing
+
+This feature allows you to process multiple text-based tasks in a single batch job. Each task consists of a system instruction (optional) and a history of messages. The server will process these tasks asynchronously (currently simulating LLM interaction) and you can retrieve the status and results via the API or CLI. This is useful for running generative text tasks, analysis, or other operations that depend on instructions and message context.
+
+### Input Format (JSONL)
+
+The input for text batch processing is a JSON Lines (JSONL) file. Each line in the file must be a valid JSON object representing a single task.
+
+**Example of a single line (JSON object):**
+
+```json
+{
+  "task_id": "optional_task_identifier_string",
+  "system_instruction": "You are a helpful assistant that translates English to French.",
+  "history": [
+    {"role": "user", "content": "Hello, how are you?"},
+    {"role": "assistant", "content": "Bonjour, comment ça va ?"},
+    {"role": "user", "content": "What is your name?"}
+  ]
+}
+```
+
+**Fields:**
+
+*   `task_id` (string, optional): A unique identifier for the task. If not provided, the server will generate one.
+*   `system_instruction` (string, optional): Instructions for the "assistant" or model on how to behave or process the input.
+*   `history` (list of objects, required): A list of message objects, where each object must have:
+    *   `role` (string, required): The role of the message sender (e.g., "user", "assistant").
+    *   `content` (string, required): The content of the message.
 
 ## Installation & Usage
 
@@ -157,6 +190,7 @@ The CLI interacts with a running `llm-food` server.
 
 * **Commands:**
 
+  #### Document Conversion Commands
   ```bash
   # Convert a local file
   llm-food convert-file /path/to/your/document.pdf
@@ -164,18 +198,37 @@ The CLI interacts with a running `llm-food` server.
   # Convert content from a URL
   llm-food convert-url "http://example.com/article.html"
 
-  # Create a batch job (upload multiple files)
+  # Create a batch job for document conversion (upload multiple files)
   llm-food batch-create /path/to/file1.docx /path/to/file2.pdf gs://your-bucket/outputs/
 
-  # Get the status of a batch job
+  # Get the status of a document conversion batch job
   llm-food batch-status <your_task_id>
 
-  # get the results in Markdown
-  llm-food batch-results <your_task_id>
+  # Get the results in Markdown for a document conversion batch job
+  llm-food batch-results <your_task_id> --save-dir ./my_markdown_outputs
+  ```
 
+  #### Text Batch Processing Commands
+  ```bash
+  # Create a text batch job from a JSONL file
+  llm-food text-batch-create /path/to/your/tasks.jsonl --job-name "My Translation Job"
+
+  # Get the status of a text batch job
+  llm-food text-batch-status <your_job_id>
+
+  # Get the results of a text batch job
+  llm-food text-batch-results <your_job_id>
+
+  # Get results and save the full JSON response to a file
+  llm-food text-batch-results <your_job_id> --save-dir ./job_outputs
+  ```
+
+  #### General Commands
+  ```bash
   # Get help
   llm-food --help
   llm-food convert-file --help
+  # etc. for other commands
   ```
 
 **Python Client Usage (Programmatic):**
@@ -200,27 +253,44 @@ async def main():
         print("\nConverted URL:")
         print(f"  Filename: {url_response.filename}")
 
-        # Create a batch job
-        batch_job = await client.create_batch_job(
+        # Create a document conversion batch job
+        doc_batch_job = await client.create_batch_job(
             file_paths=["path/to/report.pdf", "path/to/notes.docx"],
             output_gcs_path="gs://your-gcs-bucket/batch_outputs/"
         )
-        task_id = batch_job["task_id"]
-        print(f"\nBatch job created with Task ID: {task_id}")
+        doc_task_id = doc_batch_job["task_id"]
+        print(f"\nDocument Batch job created with Task ID: {doc_task_id}")
+
+        # Create a text batch job
+        # First, create a dummy tasks.jsonl file
+        with open("tasks.jsonl", "w") as f:
+            f.write('{"system_instruction": "Translate to French.", "history": [{"role": "user", "content": "Hello world"}]}\n')
+            f.write('{"task_id": "task_002", "history": [{"role": "user", "content": "Explain quantum physics simply."}]}\n')
+        
+        text_batch_job_response = await client.create_text_batch_job(
+            file_path="tasks.jsonl",
+            job_name="My Text Processing Job"
+        )
+        text_job_id = text_batch_job_response["job_id"]
+        print(f"\nText Batch job created with Job ID: {text_job_id}")
 
         # Poll for batch job status (example, implement more robust polling)
-        # await asyncio.sleep(10) # Give server time to process
-        # batch_status = await client.get_batch_job_status(task_id)
-        # print(f"\nBatch Job Status ({task_id}): {batch_status.status}")
-        # if batch_status.outputs:
-        #     print("Outputs:")
-        #     for item in batch_status.outputs:
-        #         print(f"  - {item.original_filename}: {item.gcs_output_uri}")
+        # await asyncio.sleep(10) 
+        # doc_batch_status = await client.get_detailed_batch_job_status(doc_task_id) # For doc conversion
+        # print(f"\nDocument Batch Job Status ({doc_task_id}): {doc_batch_status.status}")
+
+        # text_job_status = await client.get_text_batch_job_status(text_job_id)
+        # print(f"\nText Batch Job Status ({text_job_id}): {text_job_status['status']}")
+
 
     except LLMFoodClientError as e:
         print(f"Client Error: {e}")
     except FileNotFoundError as e:
         print(f"File Error: {e}")
+    finally:
+        if os.path.exists("tasks.jsonl"): # Clean up dummy file
+            os.remove("tasks.jsonl")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -269,18 +339,32 @@ if __name__ == "__main__":
   * Synchronously converts the content of a given URL to Markdown.
   * Request: Query parameter `url=your_url_here`.
   * Response: JSON with `filename` (derived from URL), `content_hash`, and `texts`.
-* `POST /batch`:
-  * Asynchronously processes multiple uploaded files. PDF files are processed using the Gemini Batch API; other supported formats are processed as individual background tasks.
+* `POST /batch` (Document Conversion Batch):
+  * Asynchronously processes multiple uploaded document files (PDF, DOCX, etc.). PDF files are processed using the Gemini Batch API; other supported formats are processed as individual background tasks.
   * Request: `multipart/form-data` with:
     * `files`: One or more files.
     * `output_gcs_path`: A GCS directory URI (e.g., `gs://your-output-bucket/markdown_output/`) where the final Markdown files will be saved.
   * Response: JSON with `task_id` for the main batch job.
-* `GET /status/{task_id}`:
-  * Checks the status of an asynchronous batch job created via `/batch`.
+* `GET /status/{task_id}` (Document Conversion Batch Status):
+  * Checks the status of an asynchronous document conversion batch job created via `/batch`.
   * Response: JSON with detailed job status, including overall progress, Gemini PDF batch sub-job status (if any), and individual file processing statuses stored in DuckDB.
-* `GET /batch/{task_id}`:
-  * Retrieves the Markdown output for successfully processed files from a completed batch job.
+* `GET /batch/{task_id}` (Document Conversion Batch Results):
+  * Retrieves the Markdown output for successfully processed files from a completed document conversion batch job.
   * Response: JSON containing the job status, a list of successfully converted files (with their original filename, GCS output URI, and Markdown content), and a list of any errors encountered for specific files.
+
+### Text Batch Processing Endpoints
+* `POST /text-batch`:
+  * Asynchronously processes multiple text-based tasks provided in a JSONL file.
+  * Request: `multipart/form-data` with:
+    * `file`: A JSONL file where each line is a task object (see "Input Format (JSONL)" above).
+    * `job_name` (optional form field): A name for the text batch job.
+  * Response: JSON with `job_id` for the created text batch job and a confirmation message.
+* `GET /text-batch/{job_id}/status`:
+  * Retrieves the current status of a text batch job, including the status of individual tasks.
+  * Response: JSON object (`TextBatchJobStatusResponse`) detailing the job's progress, total tasks, processed tasks, failed tasks, and a list of individual task statuses.
+* `GET /text-batch/{job_id}/results`:
+  * Retrieves the results of a completed (or partially completed) text batch job.
+  * Response: JSON object (`TextBatchJobResultsResponse`) containing the job's overall status and a list of results for each task, including the original input, generated text (if successful), or an error message (if failed).
 
 ## Server Configuration (Environment Variables)
 
@@ -304,7 +388,7 @@ GOOGLE_CLOUD_PROJECT=your-gcp-project-id
 GOOGLE_CLOUD_LOCATION=us-central1 # e.g., us-central1, europe-west1
 GCS_BUCKET=your-llm-food-bucket # For temporary files and batch outputs
 GOOGLE_APPLICATION_CREDENTIALS= # Path to service account JSON for local/non-GCP environments
-GEMINI_MODEL_FOR_VISION=gemini-2.0-flash-001
+GEMINI_MODEL_FOR_VISION=gemini-1.0-pro-vision # Changed to a generally available model from example (gemini-2.0-flash-001 might not exist)
 # GEMINI_OCR_PROMPT="Your custom OCR prompt here..."
 
 # --- DuckDB Configuration (Server-side) ---
@@ -327,7 +411,7 @@ DUCKDB_FILE=batch_tasks.duckdb # Path to the DuckDB database file
   * Storing temporary intermediate files for PDF batch processing.
   * The `output_gcs_path` provided in the `/batch` request will also typically be a path *within* this bucket.
 * `GOOGLE_APPLICATION_CREDENTIALS`: For local development or non-GCP environments to authenticate GCS and Gemini calls.
-* `GEMINI_MODEL_FOR_VISION`: Gemini model used for OCR.
+* `GEMINI_MODEL_FOR_VISION`: Gemini model used for OCR. (Note: The example value was updated to `gemini-1.0-pro-vision` as `gemini-2.0-flash-001` might be hypothetical or too new).
 * `GEMINI_OCR_PROMPT`: Allows customization of the prompt sent to Gemini for OCR tasks.
 * `DUCKDB_FILE`: Path where the DuckDB database file for task tracking will be stored by the server.
 
