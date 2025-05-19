@@ -91,7 +91,7 @@ async def main_async():
         help="Print detailed sub-job and individual file task statuses.",
     )
 
-    # Batch results command - NEW
+    # Batch results command
     parser_batch_results = subparsers.add_parser(
         "batch-results", help="Retrieve and save results of a completed batch job."
     )
@@ -100,9 +100,40 @@ async def main_async():
         "--save-dir",
         type=str,
         help="Directory to save successful Markdown outputs. Files will be named based on original filenames. Defaults to a folder named after the task ID in the current directory if not provided and job is successful.",
-        default=None,  # Will be handled dynamically later
+        default=None,  
     )
 
+    # --- Text Batch Processing Subcommands ---
+    # text-batch-create
+    text_batch_create_parser = subparsers.add_parser(
+        "text-batch-create",
+        help="Create a new text batch processing job from a JSONL file",
+    )
+    text_batch_create_parser.add_argument(
+        "file_path", type=str, help="Path to the JSONL file"
+    )
+    text_batch_create_parser.add_argument(
+        "--job-name", type=str, help="Optional name for the job"
+    )
+
+    # text-batch-status
+    text_batch_status_parser = subparsers.add_parser(
+        "text-batch-status", help="Get the status of a text batch processing job"
+    )
+    text_batch_status_parser.add_argument("job_id", type=str, help="ID of the job")
+
+    # text-batch-results
+    text_batch_results_parser = subparsers.add_parser(
+        "text-batch-results",
+        help="Get the results of a completed text batch processing job",
+    )
+    text_batch_results_parser.add_argument("job_id", type=str, help="ID of the job")
+    text_batch_results_parser.add_argument(
+        "--save-dir",
+        type=str,
+        help="Directory to save the full JSON results. File will be named {job_id}_results.json.",
+    )
+    
     args = parser.parse_args()
 
     client = LLMFoodClient(base_url=args.server_url, api_token=args.token)
@@ -119,9 +150,9 @@ async def main_async():
                 except IOError as e:
                     print(
                         f"Error saving file {args.output_file}: {e}",
-                        file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                        file=sys.stderr,
                     )
-                    exit(1)  # Exit if saving failed
+                    exit(1)
             else:
                 print(json.dumps(result.model_dump(), indent=2))
         elif args.command == "convert-url":
@@ -135,9 +166,9 @@ async def main_async():
                 except IOError as e:
                     print(
                         f"Error saving file {args.output_file}: {e}",
-                        file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                        file=sys.stderr,
                     )
-                    exit(1)  # Exit if saving failed
+                    exit(1)
             else:
                 print(json.dumps(result.model_dump(), indent=2))
         elif args.command == "batch-create":
@@ -149,20 +180,20 @@ async def main_async():
                 if not input_path.exists():
                     print(
                         f"Error: Path does not exist: {path_str}",
-                        file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                        file=sys.stderr,
                     )
                     has_errors = True
-                    continue  # Continue to check other paths but mark that an error occurred
+                    continue 
 
                 if input_path.is_file():
                     if input_path.suffix.lower() in SUPPORTED_EXTENSIONS:
                         files_to_process.append(
                             str(input_path.resolve())
-                        )  # Use absolute path
+                        ) 
                     else:
                         print(
                             f"Warning: File skipped (unsupported extension): {path_str}",
-                            file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                            file=sys.stderr,
                         )
                 elif input_path.is_dir():
                     print(f"Processing directory: {path_str}")
@@ -171,65 +202,57 @@ async def main_async():
                         for found_file in input_path.rglob(f"*{ext}"):
                             if (
                                 found_file.is_file()
-                            ):  # Ensure it's a file, not a dir ending with .ext
+                            ): 
                                 files_to_process.append(
                                     str(found_file.resolve())
-                                )  # Use absolute path
+                                ) 
                                 found_in_dir = True
                     if not found_in_dir:
                         print(
                             f"Warning: No supported files found in directory: {path_str}",
-                            file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                            file=sys.stderr,
                         )
                 else:
-                    # This case should ideally not be reached if exists() and is_file()/is_dir() are comprehensive
                     print(
                         f"Error: Path is not a valid file or directory: {path_str}",
-                        file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                        file=sys.stderr,
                     )
                     has_errors = True
 
             if has_errors:
                 print(
                     "Errors occurred while validating input paths. Aborting batch creation.",
-                    file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                    file=sys.stderr,
                 )
                 exit(1)
 
             if not files_to_process:
                 print(
                     "Error: No supported files found to process. Batch creation aborted.",
-                    file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                    file=sys.stderr,
                 )
                 exit(1)
 
-            # Deduplicate list while preserving order (Python 3.7+ for dict.fromkeys)
-            # For broader compatibility, set then list might reorder, but for file paths order might not be critical here.
-            # Using resolve() for absolute paths should help in deduplication if relative paths point to same file.
             unique_files_to_process = sorted(
                 list(set(files_to_process))
-            )  # Sort for consistent ordering if duplicates existed
+            ) 
 
             if not unique_files_to_process:
                 print(
                     "Error: No supported files remained after deduplication. Batch creation aborted.",
-                    file=sys.stderr if "sys" in globals() else os.sys.stderr,
+                    file=sys.stderr,
                 )
                 exit(1)
 
             print(
                 f"Found {len(unique_files_to_process)} unique supported file(s) to process for the batch job."
             )
-            # Optionally print the list of files if verbose or for debugging
-            # for f_path in unique_files_to_process:
-            #     print(f"  - {f_path}")
 
             result = await client.create_batch_job(
                 unique_files_to_process, args.output_gcs_path
             )
-            print(json.dumps(result, indent=2))  # server returns a dict directly
+            print(json.dumps(result, indent=2))
         elif args.command == "batch-status":
-            # This command now shows DETAILED status from /status/{task_id}
             detailed_status: BatchJobStatusResponse = (
                 await client.get_detailed_batch_job_status(args.task_id)
             )
@@ -308,7 +331,6 @@ async def main_async():
             )
 
         elif args.command == "batch-results":
-            # This command fetches and optionally saves results from /batch/{task_id}
             results_response = await client.get_batch_job_results(args.task_id)
 
             print(f"Results for Batch Job ID: {results_response.job_id}")
@@ -320,7 +342,7 @@ async def main_async():
             save_directory = args.save_dir
             if (
                 not save_directory and results_response.outputs
-            ):  # Default save_dir if outputs exist and not specified
+            ): 
                 save_directory = os.path.join(
                     os.getcwd(), f"llm_food_outputs_{results_response.job_id}"
                 )
@@ -369,12 +391,40 @@ async def main_async():
                         print(f"    Error: {error_item.error_message}")
             else:
                 print("No errors reported for this job.")
+        
+        # --- Text Batch Command Handling ---
+        elif args.command == "text-batch-create":
+            result = await client.create_text_batch_job(
+                args.file_path, args.job_name
+            )
+            print(json.dumps(result, indent=2))
+        elif args.command == "text-batch-status":
+            result = await client.get_text_batch_job_status(args.job_id)
+            print(json.dumps(result, indent=2))
+        elif args.command == "text-batch-results":
+            result = await client.get_text_batch_job_results(args.job_id)
+            if args.save_dir:
+                os.makedirs(args.save_dir, exist_ok=True)
+                output_path = os.path.join(args.save_dir, f"{args.job_id}_results.json")
+                try:
+                    with open(output_path, "w", encoding="utf-8") as f:
+                        json.dump(result, f, indent=2)
+                    print(f"Text batch job results saved to: {output_path}")
+                except IOError as e:
+                    print(
+                        f"Error saving results file {output_path}: {e}",
+                        file=sys.stderr,
+                    )
+                    print("\nFull JSON response:") 
+                    print(json.dumps(result, indent=2))
+            else:
+                print(json.dumps(result, indent=2))
 
     except LLMFoodClientError as e:
         print(
             f"Client Error: {e}",
             file=sys.stderr,
-        )  # Print to stderr
+        )
         if e.response_text:
             print(
                 f"Server Response: {e.response_text}",
