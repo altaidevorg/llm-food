@@ -771,8 +771,10 @@ async def _process_single_non_pdf_file_and_upload(
         output_blob_obj = bucket.blob(output_blob_name)
 
         # Upload the markdown content
-        output_blob_obj.upload_from_string(
-            full_markdown_output, content_type="text/markdown"
+        await asyncio.to_thread(
+            output_blob_obj.upload_from_string(
+                full_markdown_output, content_type="text/markdown"
+            )
         )
         gcs_output_url = f"gs://{bucket_name}/{output_blob_name}"
 
