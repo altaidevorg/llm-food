@@ -1,12 +1,14 @@
 import asyncio
 import base64
+import shutil
+import tempfile
 
 from datetime import datetime
 import hashlib
 import json
 from io import BytesIO
 import os
-from typing import List, Optional
+from typing import List, Optional, Dict
 import uuid
 from fastapi import (
     FastAPI,
@@ -417,7 +419,7 @@ def status(task_id: str):
 
 
 @app.post("/batch", dependencies=[Depends(authenticate_request)])
-async def batch_files_upload(
+def batch_files_upload(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
     output_gcs_path: str = Form(...),
@@ -426,11 +428,11 @@ async def batch_files_upload(
     current_time = datetime.utcnow()
 
     pdf_files_data_for_batch: List[
-        tuple[str, bytes]
-    ] = []  # Changed: Store (filename, content_bytes)
+        tuple[str, str]
+    ] = []  # Changed: Store (filename, temp_file_path)
     non_pdf_files_for_individual_processing: List[
-        UploadFile
-    ] = []  # Remains UploadFile for now as content is read just before adding task
+        tuple[str, str, str]
+    ] = []  # Store (filename, ext, temp_file_path)
 
     if not GCS_BATCH_BUCKET:
         raise HTTPException(
@@ -442,113 +444,134 @@ async def batch_files_upload(
             status_code=400, detail="Output GCS path must start with gs://"
         )
 
-    print("reading files...")
-    for f in files:
-        ext = os.path.splitext(f.filename)[1].lower()
-        if ext == ".pdf":
-            # Read PDF content here and store bytes
-            content_bytes = await f.read()
-            pdf_files_data_for_batch.append((f.filename, content_bytes))
-        elif ext in SUPPORTED_EXTENSIONS:  # Excludes .pdf as it's handled above
-            non_pdf_files_for_individual_processing.append(f)
-        else:
-            # Optionally log or report unsupported files
-            print(f"Skipping unsupported file: {f.filename}")
-
-    con = get_db_connection()
+    temp_files = []  # Keep track of temp files for cleanup in case of errors
     try:
-        con.execute(
-            "INSERT INTO batch_jobs (job_id, output_gcs_path, status, submitted_at, total_input_files, last_updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                main_batch_job_id,
-                output_gcs_path,
-                "pending",
-                current_time,
-                len(pdf_files_data_for_batch)
-                + len(non_pdf_files_for_individual_processing),
-                current_time,
-            ),
-        )
-        con.commit()
+        print("Processing uploaded files...")
+        for f in files:
+            ext = os.path.splitext(f.filename)[1].lower()
 
-        # Process non-PDF files
-        for upload_file in non_pdf_files_for_individual_processing:
-            file_task_id = str(uuid.uuid4())
-            file_ext = os.path.splitext(upload_file.filename)[1].lower()
+            # Create a temporary file with the original extension
+            temp_file = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+            temp_files.append(temp_file.name)
+
+            # Write uploaded content to temp file
+            shutil.copyfileobj(f.file, temp_file)
+            temp_file.close()  # Close but don't delete (delete=False above)
+
+            if ext == ".pdf":
+                pdf_files_data_for_batch.append((f.filename, temp_file.name))
+            elif ext in SUPPORTED_EXTENSIONS:  # Excludes .pdf as it's handled above
+                non_pdf_files_for_individual_processing.append(
+                    (f.filename, ext, temp_file.name)
+                )
+            else:
+                # Clean up this temp file immediately if unsupported
+                os.unlink(temp_file.name)
+                temp_files.remove(temp_file.name)
+                print(f"Skipping unsupported file: {f.filename}")
+
+        con = get_db_connection()
+        try:
             con.execute(
-                "INSERT INTO file_tasks (file_task_id, batch_job_id, original_filename, file_type, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO batch_jobs (job_id, output_gcs_path, status, submitted_at, total_input_files, last_updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (
-                    file_task_id,
                     main_batch_job_id,
-                    upload_file.filename,
-                    file_ext,
+                    output_gcs_path,
                     "pending",
                     current_time,
+                    len(pdf_files_data_for_batch)
+                    + len(non_pdf_files_for_individual_processing),
                     current_time,
                 ),
             )
-            # Read content before passing to background task
-            content_bytes = await upload_file.read()
-            await upload_file.seek(
-                0
-            )  # Reset cursor for safety, though might not be strictly needed if not read again
+            con.commit()
 
-            background_tasks.add_task(
-                _process_single_non_pdf_file_and_upload,
-                content_bytes,  # Pass content bytes
+            # Process non-PDF files
+            for (
+                orig_filename,
                 file_ext,
-                upload_file.filename,
-                output_gcs_path,
-                main_batch_job_id,
-                file_task_id,
-            )
-        con.commit()
+                temp_file_path,
+            ) in non_pdf_files_for_individual_processing:
+                file_task_id = str(uuid.uuid4())
+                con.execute(
+                    "INSERT INTO file_tasks (file_task_id, batch_job_id, original_filename, file_type, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        file_task_id,
+                        main_batch_job_id,
+                        orig_filename,
+                        file_ext,
+                        "pending",
+                        current_time,
+                        current_time,
+                    ),
+                )
 
-        # Process PDF files via Gemini Batch
-        if pdf_files_data_for_batch:
-            gemini_batch_sub_job_id = str(uuid.uuid4())
-            con.execute(
-                "INSERT INTO gemini_pdf_batch_sub_jobs (gemini_batch_sub_job_id, batch_job_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (
-                    gemini_batch_sub_job_id,
+                background_tasks.add_task(
+                    _process_single_non_pdf_file_and_upload,
+                    temp_file_path,
+                    file_ext,
+                    orig_filename,
+                    output_gcs_path,
                     main_batch_job_id,
-                    "pending_preparation",
-                    current_time,
-                    current_time,
-                ),
-            )
-            # Pass the list of (filename, content_bytes)
-            background_tasks.add_task(
-                _run_gemini_pdf_batch_conversion,
-                pdf_files_data_for_batch,  # Pass the list of (filename, content_bytes)
-                output_gcs_path,
-                main_batch_job_id,
-                gemini_batch_sub_job_id,
-            )
-            print("Added background tasks for batch prediction PDF")
-            con.commit()  # Commit after starting PDF batch task prep
+                    file_task_id,
+                )
+            con.commit()
 
-        # Update batch job status to processing if there are tasks
-        if pdf_files_data_for_batch or non_pdf_files_for_individual_processing:
-            con.execute(
-                "UPDATE batch_jobs SET status = ?, last_updated_at = ? WHERE job_id = ?",
-                ("processing", datetime.utcnow(), main_batch_job_id),
-            )
-        else:  # No files to process
-            con.execute(
-                "UPDATE batch_jobs SET status = ?, last_updated_at = ? WHERE job_id = ?",
-                ("completed_no_files", datetime.utcnow(), main_batch_job_id),
-            )
-        con.commit()
+            # Process PDF files via Gemini Batch
+            if pdf_files_data_for_batch:
+                gemini_batch_sub_job_id = str(uuid.uuid4())
+                con.execute(
+                    "INSERT INTO gemini_pdf_batch_sub_jobs (gemini_batch_sub_job_id, batch_job_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        gemini_batch_sub_job_id,
+                        main_batch_job_id,
+                        "pending_preparation",
+                        current_time,
+                        current_time,
+                    ),
+                )
+                # Pass the list of (filename, temp_file_path)
+                background_tasks.add_task(
+                    _run_gemini_pdf_batch_conversion,
+                    pdf_files_data_for_batch,
+                    output_gcs_path,
+                    main_batch_job_id,
+                    gemini_batch_sub_job_id,
+                )
+                print("Added background tasks for batch prediction PDF")
+                con.commit()
 
-    finally:
-        await _check_and_finalize_batch_job_status(
-            main_batch_job_id, con
-        )  # Call before closing
-        con.commit()  # Ensure final status update is committed
-        con.close()
-    await asyncio.sleep(0.01)  # tick so the event loop gets forward
-    return {"task_id": main_batch_job_id}
+            # Update batch job status to processing if there are tasks
+            if pdf_files_data_for_batch or non_pdf_files_for_individual_processing:
+                con.execute(
+                    "UPDATE batch_jobs SET status = ?, last_updated_at = ? WHERE job_id = ?",
+                    ("processing", datetime.utcnow(), main_batch_job_id),
+                )
+            else:  # No files to process
+                con.execute(
+                    "UPDATE batch_jobs SET status = ?, last_updated_at = ? WHERE job_id = ?",
+                    ("completed_no_files", datetime.utcnow(), main_batch_job_id),
+                )
+            con.commit()
+
+        finally:
+            _check_and_finalize_batch_job_status(main_batch_job_id, con)
+            con.commit()
+            con.close()
+
+        return {"task_id": main_batch_job_id}
+
+    except Exception as e:
+        # Clean up temp files in case of error
+        for temp_file_path in temp_files:
+            try:
+                os.unlink(temp_file_path)
+            except Exception as cleanup_error:
+                print(f"Error cleaning up temp file {temp_file_path}: {cleanup_error}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing batch upload: {str(e)}",
+        )
 
 
 @app.get(
@@ -672,7 +695,7 @@ async def get_batch_output(task_id: str):
 
 
 async def _process_single_non_pdf_file_and_upload(
-    content_bytes: bytes,
+    temp_file_path: str,
     file_ext: str,
     original_filename: str,
     output_gcs_path_str: str,
@@ -692,12 +715,14 @@ async def _process_single_non_pdf_file_and_upload(
         )
         con.commit()
 
+        # Read content from temp file
+        with open(temp_file_path, "rb") as f:
+            content_bytes = f.read()
+
         # Re-use the existing _process_file_content logic
-        # Ensure pdf_backend_choice is not relevant or handled if _process_file_content expects it
-        # For non-PDFs, pdf_backend_choice is not used by _process_file_content.
         markdown_texts = await _process_file_content(
             file_ext, content_bytes, get_pdf_backend()
-        )  # get_pdf_backend() is for PDF choice, not directly used for non-PDFs here
+        )
 
         if (
             not markdown_texts
@@ -721,30 +746,39 @@ async def _process_single_non_pdf_file_and_upload(
             )
             return
 
+        # Join all markdown texts with a separator
         full_markdown_output = "\n\n---\n\n".join(markdown_texts)
 
         # Upload to GCS
         storage_client = storage.Client(
             project=get_gcs_project_id(), credentials=get_gcs_credentials()
         )
-        output_bucket_name, output_prefix = output_gcs_path_str.replace(
-            "gs://", ""
-        ).split("/", 1)
-        output_bucket = storage_client.bucket(output_bucket_name)
 
-        output_blob_name = (
-            output_prefix.rstrip("/")
-            + "/"
-            + os.path.splitext(original_filename)[0]
-            + ".md"
+        # Parse the output GCS path
+        if not output_gcs_path_str.startswith("gs://"):
+            raise ValueError("Output GCS path must start with gs://")
+        bucket_name = output_gcs_path_str.replace("gs://", "").split("/")[0]
+        output_prefix = "/".join(
+            output_gcs_path_str.replace("gs://", "").split("/")[1:]
         )
-        output_blob_obj = output_bucket.blob(output_blob_name)
+        if output_prefix and not output_prefix.endswith("/"):
+            output_prefix += "/"
 
-        output_blob_obj.upload_from_string(
-            full_markdown_output, content_type="text/markdown"
+        # Create the output blob name
+        base_name = os.path.splitext(original_filename)[0]
+        output_blob_name = f"{output_prefix}{base_name}.md"
+        bucket = storage_client.bucket(bucket_name)
+        output_blob_obj = bucket.blob(output_blob_name)
+
+        # Upload the markdown content
+        await asyncio.to_thread(
+            output_blob_obj.upload_from_string(
+                full_markdown_output, content_type="text/markdown"
+            )
         )
-        gcs_output_url = f"gs://{output_bucket_name}/{output_blob_name}"
+        gcs_output_url = f"gs://{bucket_name}/{output_blob_name}"
 
+        # Update the task status in the database
         con.execute(
             "UPDATE file_tasks SET status = ?, gcs_output_markdown_uri = ?, updated_at = ? WHERE file_task_id = ?",
             ("completed", gcs_output_url, datetime.utcnow(), file_task_id),
@@ -754,9 +788,6 @@ async def _process_single_non_pdf_file_and_upload(
             (datetime.utcnow(), main_batch_job_id),
         )
         con.commit()
-        print(
-            f"Successfully processed and uploaded non-PDF file {original_filename} to {gcs_output_url}"
-        )
 
     except Exception as e:
         error_str = f"Error in _process_single_non_pdf_file_and_upload for {original_filename}: {str(e)}"
@@ -777,576 +808,330 @@ async def _process_single_non_pdf_file_and_upload(
                 f"Additionally, failed to update DB for task {file_task_id} failure: {db_err}"
             )
     finally:
-        await _check_and_finalize_batch_job_status(
-            main_batch_job_id, con
-        )  # Call before closing
-        con.commit()  # Ensure final status update is committed
+        # Clean up the temporary file
+        try:
+            os.unlink(temp_file_path)
+        except Exception as cleanup_err:
+            print(f"Error cleaning up temp file {temp_file_path}: {cleanup_err}")
+
+        _check_and_finalize_batch_job_status(main_batch_job_id, con)
+        con.commit()
         con.close()
 
 
-async def _run_gemini_pdf_batch_conversion(
-    pdf_inputs_list: List[
-        tuple[str, bytes]
-    ],  # Expect list of (filename, content_bytes)
+def _run_gemini_pdf_batch_conversion(
+    pdf_inputs_list: List[tuple[str, str]],  # List of (filename, temp_file_path)
     output_gcs_path_str: str,
     main_batch_job_id: str,
     gemini_batch_sub_job_id: str,
 ):
-    await asyncio.sleep(0.1)  # tick event loop
-
+    """
+    Process multiple PDFs using Gemini Batch Prediction.
+    Now accepts a list of tuples containing (filename, temp_file_path).
+    """
     current_time = datetime.utcnow()
     con = get_db_connection()
-    storage_client = storage.Client(
-        project=get_gcs_project_id(), credentials=get_gcs_credentials()
-    )
-    gemini_client = get_gemini_client()  # Ensure this client is suitable for batch
-
-    temp_gcs_input_prefix = (
-        f"gemini_batch_jobs/{main_batch_job_id}/{gemini_batch_sub_job_id}/inputs"
-    )
-    temp_gcs_images_prefix = f"{temp_gcs_input_prefix}/images"
-    temp_gcs_output_prefix = (
-        f"gemini_batch_jobs/{main_batch_job_id}/{gemini_batch_sub_job_id}/outputs"
-    )
-
-    payload_items_for_jsonl = []
-    total_pages_for_this_gemini_batch = 0
+    storage_client = None
+    gemini_client = None
 
     try:
+        # Update status to preparing
         con.execute(
             "UPDATE gemini_pdf_batch_sub_jobs SET status = ?, updated_at = ? WHERE gemini_batch_sub_job_id = ?",
-            ("preparing_images_and_payload", current_time, gemini_batch_sub_job_id),
-        )
-        con.execute(
-            "UPDATE batch_jobs SET last_updated_at = ? WHERE job_id = ?",
-            (current_time, main_batch_job_id),
+            ("preparing", current_time, gemini_batch_sub_job_id),
         )
         con.commit()
 
+        # Initialize clients
+        storage_client = storage.Client(
+            project=get_gcs_project_id(), credentials=get_gcs_credentials()
+        )
         temp_bucket = storage_client.bucket(GCS_BATCH_BUCKET)
+        gemini_client = get_gemini_client()
 
-        for (
-            original_pdf_filename,
-            pdf_content_bytes,
-        ) in pdf_inputs_list:  # Changed: Iterate through (filename, content_bytes)
-            # original_pdf_filename = pdf_upload_file.filename # Removed
-            # pdf_content_bytes = await pdf_upload_file.read() # Removed
-            # await pdf_upload_file.close() # Removed
-
+        # Process each PDF
+        page_tasks_by_pdf: Dict[str, List[str]] = {}  # filename -> [task_ids]
+        for original_pdf_filename, temp_file_path in pdf_inputs_list:
             try:
-                page_images = convert_from_bytes(pdf_content_bytes, fmt="png")
+                # Convert PDF to images
+                with open(temp_file_path, "rb") as pdf_file:
+                    page_images = convert_from_bytes(pdf_file.read(), fmt="png")
             except Exception as e:
                 print(f"Failed to convert PDF {original_pdf_filename} to images: {e}")
-                # Mark all potential pages for this PDF as failed in file_tasks if desired, or just log
-                # For now, we skip this PDF and it won't contribute to total_pages_for_this_gemini_batch
-                # and won't have file_tasks entries created here.
-                # A more robust approach might create failed file_tasks entries for it.
-                con.execute(
-                    "UPDATE gemini_pdf_batch_sub_jobs SET error_message = COALESCE(error_message || CHR(10), '') || ? WHERE gemini_batch_sub_job_id = ?",
-                    (
-                        f"Failed to convert PDF {original_pdf_filename} to images: {str(e)}",
-                        gemini_batch_sub_job_id,
-                    ),
+                error_message = f"Failed to convert PDF to images: {str(e)}"
+                _record_pdf_failure(
+                    con,
+                    main_batch_job_id,
+                    original_pdf_filename,
+                    error_message,
+                    current_time,
                 )
-                con.commit()
-                continue  # Skip to the next PDF file
+                continue
 
-            total_pages_for_this_gemini_batch += len(page_images)
-
-            for i, page_image in enumerate(page_images):
-                page_num = i + 1
-                gemini_request_id = f"{os.path.splitext(original_pdf_filename)[0]}_p{page_num}_{uuid.uuid4().hex[:8]}"
-                file_task_id = str(uuid.uuid4())
-
-                con.execute(
-                    "INSERT INTO file_tasks (file_task_id, batch_job_id, gemini_batch_sub_job_id, original_filename, file_type, status, page_number, gemini_request_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        file_task_id,
-                        main_batch_job_id,
-                        gemini_batch_sub_job_id,
-                        original_pdf_filename,
-                        "pdf_page",
-                        "pending_image_upload",
-                        page_num,
-                        gemini_request_id,
-                        datetime.utcnow(),
-                        datetime.utcnow(),
-                    ),
-                )
-                con.commit()
-
+            # Create task records and upload page images
+            page_task_ids = []
+            for page_num, page_image in enumerate(page_images, start=1):
                 try:
+                    # Create a task record for this page
+                    page_task_id = str(uuid.uuid4())
+                    page_task_ids.append(page_task_id)
+
+                    con.execute(
+                        """INSERT INTO file_tasks 
+                        (file_task_id, batch_job_id, gemini_batch_sub_job_id, original_filename, file_type, page_number, status, created_at, updated_at) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            page_task_id,
+                            main_batch_job_id,
+                            gemini_batch_sub_job_id,
+                            original_pdf_filename,
+                            ".pdf",
+                            page_num,
+                            "pending",
+                            current_time,
+                            current_time,
+                        ),
+                    )
+
+                    # Save page image to temporary GCS location
+                    temp_image_name = f"temp/{main_batch_job_id}/{page_task_id}.png"
+                    temp_blob = temp_bucket.blob(temp_image_name)
+
+                    # Save the page image to a bytes buffer and upload
                     img_byte_arr = BytesIO()
                     page_image.save(img_byte_arr, format="PNG")
-                    img_byte_arr = img_byte_arr.getvalue()
+                    img_byte_arr.seek(0)
+                    temp_blob.upload_from_file(img_byte_arr, content_type="image/png")
+                    image_gcs_uri = f"gs://{GCS_BATCH_BUCKET}/{temp_image_name}"
 
-                    image_blob_name = (
-                        f"{temp_gcs_images_prefix}/{gemini_request_id}.png"
-                    )
-                    image_blob = temp_bucket.blob(image_blob_name)
-                    image_blob.upload_from_string(
-                        img_byte_arr, content_type="image/png"
-                    )
-                    image_gcs_uri = f"gs://{GCS_BATCH_BUCKET}/{image_blob_name}"
-
+                    # Update task with image URI
                     con.execute(
                         "UPDATE file_tasks SET gcs_input_image_uri = ?, status = ?, updated_at = ? WHERE file_task_id = ?",
-                        (
-                            image_gcs_uri,
-                            "image_uploaded_to_gcs",
-                            datetime.utcnow(),
-                            file_task_id,
-                        ),
+                        (image_gcs_uri, "image_uploaded", current_time, page_task_id),
                     )
-                    con.commit()
-                    payload_items_for_jsonl.append(
-                        {
-                            "id": gemini_request_id,
-                            "request": {
-                                "contents": [
-                                    {
-                                        "role": "user",
-                                        "parts": [
-                                            {
-                                                "file_data": {
-                                                    "file_uri": image_gcs_uri,
-                                                    "mime_type": "image/png",
-                                                }
-                                            },
-                                            {"text": OCR_PROMPT},
-                                        ],
-                                    }
-                                ]
-                            },
-                        }
-                    )
+
                 except Exception as e:
                     print(
-                        f"Failed to upload image for {original_pdf_filename} page {page_num}: {e}"
+                        f"Error processing page {page_num} of {original_pdf_filename}: {e}"
                     )
+                    error_message = f"Failed to process page {page_num}: {str(e)}"
                     con.execute(
                         "UPDATE file_tasks SET status = ?, error_message = ?, updated_at = ? WHERE file_task_id = ?",
-                        (
-                            "failed",
-                            f"Image upload error: {str(e)}",
-                            datetime.utcnow(),
-                            file_task_id,
-                        ),
+                        ("failed", error_message, current_time, page_task_id),
                     )
-                    # also update gemini_pdf_batch_sub_jobs about this failure
-                    con.execute(
-                        "UPDATE gemini_pdf_batch_sub_jobs SET failed_pdf_pages_count = failed_pdf_pages_count + 1, error_message = COALESCE(error_message || CHR(10), '') || ? WHERE gemini_batch_sub_job_id = ?",
-                        (
-                            f"Failed image upload for {original_pdf_filename} page {page_num}: {str(e)}",
-                            gemini_batch_sub_job_id,
-                        ),
-                    )
-                    con.commit()
-                    # Continue to next page, this page will be marked as failed.
+                    continue
 
-        con.execute(
-            "UPDATE gemini_pdf_batch_sub_jobs SET total_pdf_pages_for_batch = ? WHERE gemini_batch_sub_job_id = ?",
-            (total_pages_for_this_gemini_batch, gemini_batch_sub_job_id),
-        )
-        con.commit()
+            if page_task_ids:  # If we successfully processed any pages
+                page_tasks_by_pdf[original_pdf_filename] = page_task_ids
+            con.commit()
 
-        if not payload_items_for_jsonl:
-            print(
-                f"No pages successfully prepared for Gemini batch sub job {gemini_batch_sub_job_id}. Aborting Gemini submission."
+            # Clean up the temporary PDF file
+            try:
+                os.unlink(temp_file_path)
+            except Exception as cleanup_err:
+                print(f"Error cleaning up temp file {temp_file_path}: {cleanup_err}")
+
+        if not page_tasks_by_pdf:
+            error_message = (
+                "No PDF pages were successfully prepared for batch processing"
             )
             con.execute(
-                "UPDATE gemini_pdf_batch_sub_jobs SET status = ?, error_message = COALESCE(error_message || CHR(10), '') || 'No pages to process', updated_at = ? WHERE gemini_batch_sub_job_id = ?",
-                ("failed_no_payload", datetime.utcnow(), gemini_batch_sub_job_id),
-            )
-            # Update main batch job if all PDFs failed here and there were no non-PDFs
-            # This logic might need to be more sophisticated at the batch_jobs level based on counts
-            con.execute(
-                "UPDATE batch_jobs SET overall_failed_count = overall_failed_count + ? WHERE job_id = ?",
-                (len(pdf_inputs_list), main_batch_job_id),
+                "UPDATE gemini_pdf_batch_sub_jobs SET status = ?, error_message = ?, updated_at = ? WHERE gemini_batch_sub_job_id = ?",
+                ("failed", error_message, current_time, gemini_batch_sub_job_id),
             )
             con.commit()
             return
 
-        # Create and upload payload.jsonl
-        payload_jsonl_content = "\n".join(
-            [json.dumps(item) for item in payload_items_for_jsonl]
+        # Prepare Gemini batch job
+        temp_gcs_input_prefix = (
+            f"gemini_batch_jobs/{main_batch_job_id}/{gemini_batch_sub_job_id}/inputs"
         )
+        temp_gcs_output_prefix = (
+            f"gemini_batch_jobs/{main_batch_job_id}/{gemini_batch_sub_job_id}/outputs"
+        )
+
+        # Create payload for Gemini batch job
+        payload_items = []
+        for task_info in con.execute(
+            "SELECT file_task_id, gcs_input_image_uri FROM file_tasks WHERE gemini_batch_sub_job_id = ? AND status = 'image_uploaded'",
+            (gemini_batch_sub_job_id,),
+        ).fetchall():
+            task_id, image_uri = task_info
+            payload_items.append(
+                {
+                    "id": task_id,
+                    "request": {
+                        "contents": [
+                            {
+                                "role": "user",
+                                "parts": [
+                                    {
+                                        "file_data": {
+                                            "file_uri": image_uri,
+                                            "mime_type": "image/png",
+                                        }
+                                    },
+                                    {"text": OCR_PROMPT},
+                                ],
+                            }
+                        ]
+                    },
+                }
+            )
+
+        # Upload payload.jsonl
+        payload_jsonl = "\n".join(json.dumps(item) for item in payload_items)
         payload_blob_name = f"{temp_gcs_input_prefix}/payload.jsonl"
         payload_blob = temp_bucket.blob(payload_blob_name)
-        payload_blob.upload_from_string(
-            payload_jsonl_content, content_type="application/jsonl"
-        )
+        payload_blob.upload_from_string(payload_jsonl, content_type="application/jsonl")
         payload_gcs_uri = f"gs://{GCS_BATCH_BUCKET}/{payload_blob_name}"
 
+        # Update status
         con.execute(
-            "UPDATE gemini_pdf_batch_sub_jobs SET payload_gcs_uri = ?, status = ?, updated_at = ? WHERE gemini_batch_sub_job_id = ?",
-            (
-                payload_gcs_uri,
-                "submitting_to_gemini",
-                datetime.utcnow(),
-                gemini_batch_sub_job_id,
-            ),
+            "UPDATE gemini_pdf_batch_sub_jobs SET status = ?, payload_gcs_uri = ?, updated_at = ? WHERE gemini_batch_sub_job_id = ?",
+            ("submitting", current_time, payload_gcs_uri, gemini_batch_sub_job_id),
         )
         con.commit()
 
-        # Submit to Gemini Batch API
-        gemini_output_uri_for_job = f"gs://{GCS_BATCH_BUCKET}/{temp_gcs_output_prefix}"
-        batch_job_config = CreateBatchJobConfig(dest=gemini_output_uri_for_job)
+        # Submit Gemini batch job
+        gemini_output_uri = f"gs://{GCS_BATCH_BUCKET}/{temp_gcs_output_prefix}"
+        batch_job_config = CreateBatchJobConfig(dest=gemini_output_uri)
 
-        print(
-            f"Submitting batch job to Gemini for {gemini_batch_sub_job_id} with model {GEMINI_MODEL_FOR_VISION}"
-        )
         gemini_job = gemini_client.batches.create(
             model=GEMINI_MODEL_FOR_VISION,
             src=payload_gcs_uri,
             config=batch_job_config,
         )
-        # The create call above blocks until job completion or failure for google-genai,
-        # or at least starts it and returns an object that can be polled. Let's assume it returns quickly with a job object.
-        # The example in the article suggests it returns a job object immediately, and then polling is done.
-        # client.batches.create() is a synchronous call that waits for the batch job to complete.
-        # This might make the background task run for a long time.
 
+        # Update with Gemini job details
         con.execute(
-            "UPDATE gemini_pdf_batch_sub_jobs SET gemini_api_job_name = ?, status = ?, gemini_output_gcs_uri_prefix = ?, updated_at = ? WHERE gemini_batch_sub_job_id = ?",
+            """UPDATE gemini_pdf_batch_sub_jobs 
+            SET status = ?, gemini_api_job_name = ?, gemini_output_gcs_uri_prefix = ?, updated_at = ? 
+            WHERE gemini_batch_sub_job_id = ?""",
             (
-                gemini_job.name,
                 str(gemini_job.state),
-                gemini_output_uri_for_job,
-                datetime.utcnow(),
+                gemini_job.name,
+                gemini_output_uri,
+                current_time,
                 gemini_batch_sub_job_id,
             ),
         )
         con.commit()
-        print(f"Gemini job {gemini_job.name} submitted. State: {gemini_job.state}")
 
-        # Polling loop (client.batches.create might already do this, check SDK behavior)
-        # If client.batches.create() is indeed blocking until completion, this loop is redundant for it,
-        # but useful if it returns immediately.
-        # For google-genai, `create` is blocking and polls until completion. `get` is then used to refresh state if needed.
-        # Let's assume `gemini_job` is the final state object after `create()` completes.
-
-        # Corrected Polling Logic based on user feedback
-        polling_interval_seconds = 30
-        completed_job_states = {
-            JobState.JOB_STATE_SUCCEEDED,
-            JobState.JOB_STATE_FAILED,
-            JobState.JOB_STATE_CANCELLED,
-            JobState.JOB_STATE_PAUSED,  # Considering PAUSED as a state to stop active polling, might need review
-        }
-
-        while gemini_job.state not in completed_job_states:
-            await asyncio.sleep(polling_interval_seconds)
-            try:
-                refreshed_job = gemini_client.batches.get(name=gemini_job.name)
-                if refreshed_job.state != gemini_job.state:
-                    gemini_job = refreshed_job  # Update job object only if state changed or to get latest info
-                    print(
-                        f"Gemini job {gemini_job.name} polling. Current state: {gemini_job.state}"
-                    )
-                    con.execute(
-                        "UPDATE gemini_pdf_batch_sub_jobs SET status = ?, updated_at = ? WHERE gemini_batch_sub_job_id = ?",
-                        (
-                            str(gemini_job.state),
-                            datetime.utcnow(),
-                            gemini_batch_sub_job_id,
-                        ),
-                    )
-                    con.commit()
-                else:
-                    # Optional: print a less verbose polling message if state hasn't changed
-                    # print(f"Gemini job {gemini_job.name} still in state: {gemini_job.state}")
-                    pass  # State unchanged, continue polling
-            except Exception as e:
-                print(
-                    f"Error during Gemini job polling for {gemini_job.name}: {e}. Will retry polling."
-                )
-                # Decide if certain errors should break the loop or be retried.
-                # For now, simple retry after sleep.
-
-        # Final state update after loop
-        con.execute(
-            "UPDATE gemini_pdf_batch_sub_jobs SET status = ?, updated_at = ? WHERE gemini_batch_sub_job_id = ?",
-            (str(gemini_job.state), datetime.utcnow(), gemini_batch_sub_job_id),
-        )
-        con.commit()
-        print(
-            f"Gemini job {gemini_job.name} polling finished. Final state: {gemini_job.state}"
-        )
-
+        # Process results if job completed successfully
         if gemini_job.state == JobState.JOB_STATE_SUCCEEDED:
-            con.execute(
-                "UPDATE gemini_pdf_batch_sub_jobs SET status = ?, updated_at = ? WHERE gemini_batch_sub_job_id = ?",
-                (
-                    "processing_gemini_results",
-                    datetime.utcnow(),
-                    gemini_batch_sub_job_id,
-                ),
-            )
-            con.commit()
+            # Find and process predictions file
+            predictions_blob = None
+            for blob in storage_client.list_blobs(
+                GCS_BATCH_BUCKET, prefix=f"{temp_gcs_output_prefix}/"
+            ):
+                if "predictions.jsonl" in blob.name:
+                    predictions_blob = blob
+                    break
 
-            # Find the predictions.jsonl file. It's in a timestamped or job-id named subfolder.
-            # The article uses a utility: get_latest_folder. Simpler: list blobs with prefix.
-            # Output is typically: gs://{dest_bucket}/{dest_prefix}/gemini_batch_JOB_ID_TIMESTAMP/predictions.jsonl
-            # The gemini_job.output_files might contain the direct path.
-            # Let's assume the Batch API produces output like: {gemini_output_uri_for_job}/{gemini_job.name}/predictions.jsonl (this structure might vary)
-            # Or more likely: {gemini_output_uri_for_job}/predictions_JOB_ID_PART_OF_URI.jsonl or similar fixed name patterns.
+            if predictions_blob:
+                predictions_content = predictions_blob.download_as_text()
 
-            # The result files are directly in the output_uri specified. e.g. {gemini_output_uri_for_job}/predictions.jsonl-00000-of-00001
-            # Or, it might be a folder. The SDK or docs should clarify this structure precisely.
-            # The article implies: `output_uri/TIMESTAMPED_FOLDER/predictions.jsonl`
-            # Let's try to list blobs to find it.
-            output_blobs = list(
-                storage_client.list_blobs(
-                    GCS_BATCH_BUCKET, prefix=f"{temp_gcs_output_prefix}/"
-                )
-            )
-            predictions_file_blob = None
-            for blob_item in output_blobs:
-                if blob_item.name.endswith("predictions.jsonl") or (
-                    "predictions.jsonl-" in blob_item.name
-                ):  # Batch output can be sharded
-                    predictions_file_blob = blob_item
-                    break  # Take the first one found, or handle multiple shards if necessary
+                # Process each prediction and update tasks
+                for line in predictions_content.splitlines():
+                    if not line.strip():
+                        continue
 
-            if not predictions_file_blob:
-                raise Exception(
-                    f"predictions.jsonl not found in Gemini output: gs://{GCS_BATCH_BUCKET}/{temp_gcs_output_prefix}/"
-                )
-
-            print(f"Downloading predictions from: {predictions_file_blob.name}")
-            predictions_content = predictions_file_blob.download_as_text()
-
-            page_markdown_results = {}
-            processed_gemini_pages = 0
-            failed_gemini_pages = 0
-
-            for line in predictions_content.splitlines():
-                if not line.strip():
-                    continue
-                try:
                     prediction = json.loads(line)
-                    request_id = prediction["id"]  # This is our gemini_request_id
-                    # Assuming direct text output as we didn't ask for structured JSON response for the text itself
+                    task_id = prediction["id"]
                     markdown_text = prediction["response"]["candidates"][0]["content"][
                         "parts"
                     ][0]["text"]
-                    page_markdown_results[request_id] = markdown_text
-                    processed_gemini_pages += 1
-                except Exception as e:
-                    print(f"Error parsing prediction line: {line}, Error: {e}")
-                    # How to map this failure back to a specific page if ID is unparsable?
-                    # For now, just count as a general parsing failure for the batch.
-                    failed_gemini_pages += 1  # This is a prediction parsing failure, not a page processing failure yet.
 
-            # Aggregate results by original PDF and upload
-            # Group file_tasks by original_filename for those in this gemini_batch_sub_job_id
-            pdf_page_tasks_cursor = con.execute(
-                "SELECT file_task_id, original_filename, page_number, gemini_request_id FROM file_tasks WHERE gemini_batch_sub_job_id = ? ORDER BY original_filename, page_number ASC",
-                (gemini_batch_sub_job_id,),
-            ).fetchall()
-
-            aggregated_pdfs = {}
-            for task_row_tuple in pdf_page_tasks_cursor:
-                task_id, pdf_name, page_no, req_id = task_row_tuple
-                if pdf_name not in aggregated_pdfs:
-                    aggregated_pdfs[pdf_name] = []
-
-                markdown = page_markdown_results.get(req_id)
-                if markdown:
-                    aggregated_pdfs[pdf_name].append(
-                        (page_no, markdown, task_id, "completed")
-                    )
-                else:
-                    # This page's markdown wasn't found in predictions, or failed parsing earlier
-                    aggregated_pdfs[pdf_name].append(
-                        (
-                            page_no,
-                            "Error: OCR output not found for this page.",
-                            task_id,
-                            "failed",
-                        )
-                    )
+                    # Update task with result
                     con.execute(
-                        "UPDATE gemini_pdf_batch_sub_jobs SET failed_pdf_pages_count = failed_pdf_pages_count + 1 WHERE gemini_batch_sub_job_id = ?",
-                        (gemini_batch_sub_job_id,),
+                        """UPDATE file_tasks 
+                        SET status = ?, markdown_content = ?, updated_at = ? 
+                        WHERE file_task_id = ?""",
+                        ("completed", markdown_text, current_time, task_id),
                     )
-                    con.commit()
 
-            final_pdfs_processed_count = 0
-            final_pdfs_failed_count = 0
+                # Aggregate results by PDF and upload final markdown files
+                for pdf_filename, task_ids in page_tasks_by_pdf.items():
+                    # Get all successful pages for this PDF
+                    pages_data = con.execute(
+                        """SELECT page_number, markdown_content 
+                        FROM file_tasks 
+                        WHERE file_task_id IN (SELECT UNNEST(?)) 
+                        AND status = 'completed'
+                        ORDER BY page_number""",
+                        (task_ids,),
+                    ).fetchall()
 
-            for pdf_name, pages_data in aggregated_pdfs.items():
-                pages_data.sort(key=lambda x: x[0])  # Sort by page_number
-                full_pdf_markdown = "\n\n---\n\n".join(
-                    [p_data[1] for p_data in pages_data]
-                )
+                    if pages_data:
+                        # Combine all pages
+                        full_markdown = "\n\n---\n\n".join(
+                            page[1] for page in pages_data
+                        )
 
-                output_bucket_name_final, output_prefix_final = (
-                    output_gcs_path_str.replace("gs://", "").split("/", 1)
-                )
-                output_bucket_final = storage_client.bucket(output_bucket_name_final)
-                final_blob_name = (
-                    output_prefix_final.rstrip("/")
-                    + "/"
-                    + os.path.splitext(pdf_name)[0]
-                    + ".md"
-                )
-                final_blob_obj = output_bucket_final.blob(final_blob_name)
+                        # Upload final markdown
+                        output_bucket_name = output_gcs_path_str.replace(
+                            "gs://", ""
+                        ).split("/")[0]
+                        output_prefix = "/".join(
+                            output_gcs_path_str.replace("gs://", "").split("/")[1:]
+                        )
+                        if output_prefix and not output_prefix.endswith("/"):
+                            output_prefix += "/"
 
-                try:
-                    final_blob_obj.upload_from_string(
-                        full_pdf_markdown, content_type="text/markdown"
-                    )
-                    gcs_final_url = f"gs://{output_bucket_name_final}/{final_blob_name}"
-                    # Mark all page tasks for this PDF based on their individual outcomes
-                    all_pages_succeeded = True
-                    for p_data_item in pages_data:
-                        p_task_id, p_status = p_data_item[2], p_data_item[3]
-                        p_error_msg = p_data_item[1] if p_status == "failed" else None
+                        final_blob_name = (
+                            f"{output_prefix}{os.path.splitext(pdf_filename)[0]}.md"
+                        )
+                        final_bucket = storage_client.bucket(output_bucket_name)
+                        final_blob = final_bucket.blob(final_blob_name)
+                        final_blob.upload_from_string(
+                            full_markdown, content_type="text/markdown"
+                        )
+
+                        # Update all tasks for this PDF with the final URI
+                        final_uri = f"gs://{output_bucket_name}/{final_blob_name}"
                         con.execute(
-                            "UPDATE file_tasks SET status = ?, gcs_output_markdown_uri = ?, error_message = ?, updated_at = ? WHERE file_task_id = ?",
-                            (
-                                p_status,
-                                gcs_final_url if p_status == "completed" else None,
-                                p_error_msg,
-                                datetime.utcnow(),
-                                p_task_id,
-                            ),
+                            """UPDATE file_tasks 
+                            SET gcs_output_markdown_uri = ? 
+                            WHERE file_task_id IN (SELECT UNNEST(?))""",
+                            (final_uri, task_ids),
                         )
-                        if p_status == "failed":
-                            all_pages_succeeded = False
 
-                    if all_pages_succeeded:
-                        final_pdfs_processed_count += 1
-                        con.execute(
-                            "UPDATE gemini_pdf_batch_sub_jobs SET processed_pdf_pages_count = processed_pdf_pages_count + ? WHERE gemini_batch_sub_job_id = ?",
-                            (len(pages_data), gemini_batch_sub_job_id),
-                        )
-                    else:
-                        final_pdfs_failed_count += (
-                            1  # Count PDF as failed if any page failed
-                        )
-                    con.commit()
-                except Exception as upload_exc:
-                    print(
-                        f"Failed to upload final aggregated PDF {pdf_name}: {upload_exc}"
-                    )
-                    final_pdfs_failed_count += 1
-                    # Mark all page tasks for this PDF as failed due to final upload error
-                    for p_data_item in pages_data:
-                        p_task_id = p_data_item[2]
-                        con.execute(
-                            "UPDATE file_tasks SET status = ?, error_message = ?, updated_at = ? WHERE file_task_id = ?",
-                            (
-                                "failed",
-                                f"Final GCS upload error: {str(upload_exc)}",
-                                datetime.utcnow(),
-                                p_task_id,
-                            ),
-                        )
-                    con.execute(
-                        "UPDATE gemini_pdf_batch_sub_jobs SET failed_pdf_pages_count = failed_pdf_pages_count + ? WHERE gemini_batch_sub_job_id = ?",
-                        (len(pages_data), gemini_batch_sub_job_id),
-                    )
-                    con.commit()
+                # Update sub-job status
+                con.execute(
+                    """UPDATE gemini_pdf_batch_sub_jobs 
+                    SET status = 'completed', updated_at = ? 
+                    WHERE gemini_batch_sub_job_id = ?""",
+                    (current_time, gemini_batch_sub_job_id),
+                )
+                con.commit()
 
-            con.execute(
-                "UPDATE batch_jobs SET overall_processed_count = overall_processed_count + ?, overall_failed_count = overall_failed_count + ?, last_updated_at = ? WHERE job_id = ?",
-                (
-                    final_pdfs_processed_count,
-                    final_pdfs_failed_count,
-                    datetime.utcnow(),
-                    main_batch_job_id,
-                ),
-            )
-            con.execute(
-                "UPDATE gemini_pdf_batch_sub_jobs SET status = ?, updated_at = ? WHERE gemini_batch_sub_job_id = ?",
-                ("completed", datetime.utcnow(), gemini_batch_sub_job_id),
-            )
-            con.commit()
-            print(
-                f"Gemini PDF batch sub job {gemini_batch_sub_job_id} completed successfully."
-            )
+            else:
+                raise Exception("Predictions file not found in Gemini output")
 
-        else:  # Gemini job did not succeed
-            error_msg_from_job = (
-                str(gemini_job.error)
-                if hasattr(gemini_job, "error") and gemini_job.error
-                else "Unknown Gemini job failure"
-            )
-            print(
-                f"Gemini job {gemini_job.name} failed. State: {gemini_job.state}, Error: {error_msg_from_job}"
-            )
-            con.execute(
-                "UPDATE gemini_pdf_batch_sub_jobs SET status = ?, error_message = COALESCE(error_message || CHR(10), '') || ?, updated_at = ? WHERE gemini_batch_sub_job_id = ?",
-                (
-                    f"failed_gemini_job_{str(gemini_job.state)}",
-                    error_msg_from_job,
-                    datetime.utcnow(),
-                    gemini_batch_sub_job_id,
-                ),
-            )
-            # Mark all associated file_tasks as failed
-            con.execute(
-                "UPDATE file_tasks SET status='failed', error_message=?, updated_at=? WHERE gemini_batch_sub_job_id = ?",
-                (
-                    f"Gemini job failed: {error_msg_from_job}",
-                    datetime.utcnow(),
-                    gemini_batch_sub_job_id,
-                ),
-            )
-            con.execute(
-                "UPDATE batch_jobs SET overall_failed_count = overall_failed_count + ? WHERE job_id = ?",
-                (len(pdf_inputs_list), main_batch_job_id),
-            )  # Approx count
-            con.commit()
+        else:
+            error_message = f"Gemini job failed with state: {gemini_job.state}"
+            raise Exception(error_message)
 
     except Exception as e:
-        error_str = f"Error in _run_gemini_pdf_batch_conversion for sub-job {gemini_batch_sub_job_id}: {str(e)}"
-        print(error_str)
-        # Attempt to mark sub-job as failed in DB
+        error_message = f"Error in PDF batch conversion: {str(e)}"
+        print(error_message)
         try:
             con.execute(
-                "UPDATE gemini_pdf_batch_sub_jobs SET status = ?, error_message = COALESCE(error_message || CHR(10), '') || ?, updated_at = ? WHERE gemini_batch_sub_job_id = ?",
-                (
-                    "failed_internal_error",
-                    error_str,
-                    datetime.utcnow(),
-                    gemini_batch_sub_job_id,
-                ),
-            )
-            # Also mark relevant file_tasks as failed if they weren't already
-            con.execute(
-                "UPDATE file_tasks SET status='failed', error_message=? WHERE gemini_batch_sub_job_id = ? AND status NOT IN ('completed', 'failed')",
-                (
-                    f"Internal error in batch: {error_str[:200]}",
-                    gemini_batch_sub_job_id,
-                ),
-            )
-            # Update overall batch job with failures - this is an approximation
-            con.execute(
-                "UPDATE batch_jobs SET overall_failed_count = overall_failed_count + (SELECT COUNT(*) FROM file_tasks WHERE gemini_batch_sub_job_id = ? AND status = 'failed'), last_updated_at = ? WHERE job_id = ?",
-                (gemini_batch_sub_job_id, datetime.utcnow(), main_batch_job_id),
+                "UPDATE gemini_pdf_batch_sub_jobs SET status = ?, error_message = ?, updated_at = ? WHERE gemini_batch_sub_job_id = ?",
+                ("failed", error_message, current_time, gemini_batch_sub_job_id),
             )
             con.commit()
         except Exception as db_err:
-            print(
-                f"Additionally, failed to update DB for PDF batch sub-job {gemini_batch_sub_job_id} failure: {db_err}"
-            )
+            print(f"Additionally, failed to update DB for failure: {db_err}")
     finally:
-        # Clean up temporary image files from GCS_BATCH_TEMP_BUCKET/images to save costs (optional)
-        # This requires listing and deleting, can be a separate cleanup task or done here.
-        # For simplicity, not implemented in this iteration.
-        # print(f"Cleaning up GCS temp files for {gemini_batch_sub_job_id} - not implemented")
-        await _check_and_finalize_batch_job_status(
-            main_batch_job_id, con
-        )  # Call before closing
-        con.commit()  # Ensure final status update is committed
-        con.close()
+        if con:
+            _check_and_finalize_batch_job_status(main_batch_job_id, con)
+            con.commit()
+            con.close()
 
 
-async def _check_and_finalize_batch_job_status(
+def _check_and_finalize_batch_job_status(
     main_batch_job_id: str, con: duckdb.DuckDBPyConnection
 ):
     """Checks if all tasks for a batch job are completed and updates the main job status.
@@ -1390,14 +1175,42 @@ async def _check_and_finalize_batch_job_status(
                     "UPDATE batch_jobs SET status = ?, last_updated_at = ? WHERE job_id = ?",
                     (new_status, datetime.utcnow(), main_batch_job_id),
                 )
-                # No commit here, assuming caller will commit or it's part of a larger transaction within the caller.
-                # However, for safety if called at the very end, a commit might be desired directly here.
-                # For now, let the caller manage commit after this check.
     except Exception as e:
         print(
             f"Error in _check_and_finalize_batch_job_status for {main_batch_job_id}: {e}"
         )
         # Optionally, update main batch job to a specific error state if this check itself fails critically
+
+
+def _record_pdf_failure(
+    con: duckdb.DuckDBPyConnection,
+    batch_job_id: str,
+    pdf_filename: str,
+    error_message: str,
+    current_time: datetime,
+):
+    """Helper function to record PDF failures in the database."""
+    file_task_id = str(uuid.uuid4())
+    con.execute(
+        """INSERT INTO file_tasks 
+        (file_task_id, batch_job_id, original_filename, file_type, status, error_message, created_at, updated_at) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            file_task_id,
+            batch_job_id,
+            pdf_filename,
+            ".pdf",
+            "failed",
+            error_message,
+            current_time,
+            current_time,
+        ),
+    )
+    con.execute(
+        "UPDATE batch_jobs SET overall_failed_count = overall_failed_count + 1, last_updated_at = ? WHERE job_id = ?",
+        (current_time, batch_job_id),
+    )
+    con.commit()
 
 
 # --- Main function for Uvicorn ---

@@ -1,0 +1,209 @@
+---
+description: llm-food project: PDFProcessingStrategy (Synchronous) for configurable PDF-to-Markdown conversion in synchronous API calls via /convert endpoint.
+globs: 
+alwaysApply: false
+---
+# Chapter 6: PDFProcessingStrategy (Synchronous)
+
+Welcome to Chapter 6! In the previous chapter, [BatchJobOrchestrator](batchjoborchestrator.mdc), we explored how `llm-food` handles asynchronous batch processing of multiple files, including PDFs via the Gemini Batch API. This chapter shifts focus back to synchronous, single-file processing, specifically detailing the **PDFProcessingStrategy (Synchronous)** employed by the `/convert` endpoint.
+
+## Motivation and Purpose
+
+Processing PDF documents can be complex due to their varied nature (text-based, image-based, mixed) and the desired output quality (simple text extraction vs. layout-preserving Markdown). Different PDF processing libraries and services offer distinct advantages in terms of output quality, speed, licensing, and cost (e.g., using cloud AI services).
+
+The `PDFProcessingStrategy (Synchronous)` addresses the technical problem of **providing flexibility in how PDF files are converted to Markdown within the synchronous `/convert` API endpoint**. Instead of hardcoding a single PDF processing method, `llm-food` implements the Strategy design pattern. This allows the server's PDF processing behavior to be configured via the `PDF_BACKEND` environment variable, enabling users or administrators to choose a backend (e.g., Google Gemini, `pymupdf4llm`, `pypdf2`) that best suits their requirements without altering the core API endpoint logic.
+
+This pattern promotes:
+- **Flexibility**: Adapt to different PDF types and quality needs.
+- **Extensibility**: Easily add new PDF processing methods in the future.
+- **Maintainability**: Decouples PDF processing choices from the main request handling logic.
+
+**Central Use Case:** A user uploads a PDF file (e.g., `report.pdf`) to the `POST /convert` endpoint. The `llm-food` server, based on its `PDF_BACKEND` configuration (e.g., set to `"pymupdf4llm"`), dynamically selects and uses the `pymupdf4llm` library to convert the PDF content to Markdown. The resulting Markdown is then returned to the user in the API response. If `PDF_BACKEND` were set to `"gemini"`, the server would instead use the Google Gemini API for OCR and Markdown conversion of that same PDF.
+
+This strategy is distinct from the batch PDF processing discussed in [BatchJobOrchestrator](batchjoborchestrator.mdc), which *exclusively* uses the Gemini Batch API for scalability.
+
+## How It Works: Configuration and Dispatch
+
+The core of this strategy lies in the interaction between server configuration and the dispatch logic within the `_process_file_content` function (introduced in [SynchronousConversionService](synchronousconversionservice.mdc) and located in `llm_food/app.py`).
+
+### 1. Configuration via `PDF_BACKEND`
+
+The choice of PDF processing backend is determined by the `PDF_BACKEND` environment variable. The `llm_food/config.py` file provides a function to access this value:
+
+```python
+# llm_food/config.py
+import os
+
+def get_pdf_backend():
+    return os.getenv("PDF_BACKEND", "gemini") # Defaults to "gemini"
+```
+- This function retrieves the value of `PDF_BACKEND`. If the variable is not set, it defaults to `"gemini"`.
+- Supported values typically include `"gemini"`, `"pymupdf4llm"`, and `"pypdf2"`.
+
+### 2. Dynamic Dispatch in `_process_file_content`
+
+The `_process_file_content` function in `llm_food/app.py` acts as the "Context" in the Strategy pattern. When it encounters a PDF file (extension `.pdf`), it uses the `pdf_backend_choice` (obtained from `get_pdf_backend()`) to select and execute the appropriate PDF processing logic.
+
+```python
+# llm_food/app.py (Simplified excerpt from _process_file_content)
+async def _process_file_content(
+    ext: str, content: bytes, pdf_backend_choice: str
+) -> List[str]:
+    texts_list: List[str] = []
+    if ext == ".pdf":
+        if pdf_backend_choice == "pymupdf4llm":
+            texts_list = await asyncio.to_thread(_process_pdf_pymupdf4llm_sync, content)
+        elif pdf_backend_choice == "pypdf2":
+            texts_list = await asyncio.to_thread(_process_pdf_pypdf2_sync, content)
+        elif pdf_backend_choice == "gemini":
+            # ... Gemini single PDF processing logic ...
+            # (Details covered in the next section)
+            pass # Placeholder for Gemini logic
+        else:
+            texts_list = ["Invalid PDF backend specified."]
+    # ... (elif blocks for other file types like .docx, .pptx) ...
+    return texts_list
+```
+- **Input**: `ext` (file extension), `content` (file bytes), `pdf_backend_choice` (the string from `PDF_BACKEND`).
+- **Behavior**:
+  - If `ext` is `".pdf"`, it enters the PDF processing block.
+  - An `if/elif/else` structure checks `pdf_backend_choice`.
+  - Based on the choice, it calls a specific helper function (e.g., `_process_pdf_pymupdf4llm_sync`) or executes inline logic (for Gemini).
+- **`asyncio.to_thread`**: For PDF processing libraries that are synchronous (like `pymupdf` and `pypdf2`), their respective functions (`_process_pdf_pymupdf4llm_sync`, `_process_pdf_pypdf2_sync`) are executed in a separate thread pool using `await asyncio.to_thread(...)`. This prevents blocking the main FastAPI asynchronous event loop, which is crucial for server responsiveness.
+
+## Deep Dive into Available PDF Strategies
+
+Let's examine the concrete PDF processing strategies available for synchronous conversion. Each strategy aims to convert the input PDF `content` (bytes) into a `List[str]`, where each string typically represents the Markdown content of a page.
+
+### 1. Google Gemini Strategy (Single PDF, Synchronous Context)
+
+When `PDF_BACKEND` is `"gemini"`, `llm-food` uses the Google Gemini API for its powerful OCR and content understanding capabilities. This is particularly effective for scanned PDFs or PDFs with complex layouts. **Note:** This is *not* the Gemini Batch API used in asynchronous batch processing; it uses the direct `generate_content` model endpoint for each page.
+
+**Implementation Snippet (`llm_food/app.py` within `_process_file_content`):**
+```python
+# llm_food/app.py
+# Inside _process_file_content, when ext == ".pdf" and pdf_backend_choice == "gemini":
+# from pdf2image import convert_from_bytes
+# from google import genai
+# import base64
+# OCR_PROMPT = get_gemini_prompt() # From config
+# client = get_gemini_client() # Gets configured Gemini client
+
+pages = convert_from_bytes(content) # Convert PDF bytes to list of PIL Image objects
+images_b64 = []
+for page in pages:
+    buffer = BytesIO()
+    page.save(buffer, format="PNG") # Save page image to a byte buffer
+    image_data = buffer.getvalue()
+    b64_str = base64.b64encode(image_data).decode("utf-8")
+    images_b64.append(b64_str)
+
+payloads = [ # Prepare one payload per page
+    [
+        {"inline_data": {"data": b64_str, "mime_type": "image/png"}},
+        {"text": OCR_PROMPT}, # The instruction/prompt for Gemini
+    ]
+    for b64_str in images_b64
+]
+# Asynchronously call Gemini API for each page
+results = await asyncio.gather(
+    *[
+        client.aio.models.generate_content(
+            model=GEMINI_MODEL_FOR_VISION, contents=payload
+        )
+        for payload in payloads
+    ]
+)
+texts_list = [result.text for result in results] # Extract text from Gemini responses
+```
+- **Workflow**:
+  1. `pdf2image.convert_from_bytes(content)`: Converts each page of the PDF into a PIL (Pillow) Image object.
+  2. Each image is saved as PNG into an in-memory buffer and then base64 encoded.
+  3. For each page's base64 image string, a payload is constructed including the image data and the `OCR_PROMPT` (a configurable prompt asking Gemini to perform OCR and format as Markdown).
+  4. `asyncio.gather` is used to send requests to the Gemini API for all pages concurrently using `client.aio.models.generate_content`. This uses the asynchronous client for Gemini.
+  5. The text content from each Gemini response is collected into `texts_list`.
+- **Pros**: Excellent OCR quality, handles scanned/image-based PDFs well, good layout-to-Markdown conversion.
+- **Cons**: Network dependent, incurs API call costs, potentially slower than local libraries for simple text PDFs due to network latency and image conversion.
+
+### 2. `pymupdf4llm` Strategy
+
+When `PDF_BACKEND` is `"pymupdf4llm"`, this strategy leverages the `PyMuPDF` library (via the `pymupdf4llm` wrapper) which is efficient for extracting text and attempting to convert PDF structure to Markdown.
+
+**Implementation (`llm_food/app.py`):**
+```python
+# llm_food/app.py
+# from pymupdf4llm import to_markdown # Conditional import
+# import pymupdf # Conditional import
+
+def _process_pdf_pymupdf4llm_sync(content_bytes: bytes) -> List[str]:
+    try:
+        pymupdf_doc = pymupdf.Document(stream=content_bytes, filetype="pdf")
+        # 'page_chunks=True' returns a list of dicts, one per page
+        page_data_list = to_markdown(pymupdf_doc, page_chunks=True)
+        return [page_dict.get("text", "") for page_dict in page_data_list]
+    except Exception as e:
+        return [f"Error processing PDF with pymupdf4llm: {str(e)}"]
+```
+- **Workflow**:
+  1. `pymupdf.Document(stream=content_bytes, filetype="pdf")`: Loads the PDF from bytes.
+  2. `pymupdf4llm.to_markdown(pymupdf_doc, page_chunks=True)`: Converts the document to Markdown. `page_chunks=True` ensures that the output is a list, where each item is a dictionary containing the Markdown content for a page under the "text" key.
+  3. The list of Markdown strings (one per page) is returned.
+- **Pros**: Good for text-based PDFs, often preserves some formatting into Markdown, processes locally (no network/API costs), generally fast.
+- **Cons**: May struggle with complex layouts or purely image-based PDFs compared to Gemini. Output quality for scanned documents is typically lower than Gemini.
+
+### 3. `pypdf2` Strategy
+
+When `PDF_BACKEND` is `"pypdf2"`, this strategy uses the `pypdf` library (formerly `PyPDF2`) for basic text extraction.
+
+**Implementation (`llm_food/app.py`):**
+```python
+# llm_food/app.py
+# from pypdf import PdfReader # Conditional import
+
+def _process_pdf_pypdf2_sync(content_bytes: bytes) -> List[str]:
+    try:
+        reader = PdfReader(BytesIO(content_bytes))
+        return [p.extract_text() or "" for p in reader.pages] # Extract text per page
+    except Exception as e:
+        return [f"Error processing PDF with pypdf: {str(e)}"]
+```
+- **Workflow**:
+  1. `PdfReader(BytesIO(content_bytes))`: Loads the PDF from bytes.
+  2. `p.extract_text()`: For each page `p` in `reader.pages`, it extracts the plain text.
+  3. Returns a list of text strings, one for each page. This strategy does not attempt to generate Markdown formatting beyond raw text.
+- **Pros**: Very fast for text-based PDFs, simple, processes locally.
+- **Cons**: Basic text extraction only, usually loses all formatting and layout information. Does not perform OCR, so it will not extract text from image-based PDFs.
+
+## Trade-offs and When to Choose Which Strategy
+
+- **Google Gemini**: Choose for highest quality OCR, especially for scanned or image-heavy PDFs, or when preserving complex structures as Markdown is critical and API costs/latency are acceptable.
+- **`pymupdf4llm`**: A good general-purpose choice for text-based PDFs where Markdown output (with some formatting) is desired without external API calls. Balances speed and quality for digital-native PDFs.
+- **`pypdf2`**: Best for scenarios where only raw text extraction from text-based PDFs is needed, and speed is paramount. Suitable if no formatting preservation is required.
+
+## Extensibility: Adding a New PDF Processing Strategy
+
+The Strategy pattern makes it straightforward to add new PDF processing methods:
+1.  **Implement the Processing Function**: Write a new Python function, similar to `_process_pdf_pypdf2_sync` or the Gemini logic, that takes `content: bytes` and returns `List[str]`. Ensure it handles errors gracefully. If synchronous, it should be named `_process_pdf_<new_strategy_name>_sync`.
+2.  **Update Configuration**: Decide on a new string value for `PDF_BACKEND` (e.g., `"mynewpdfparser"`). Document this new option.
+3.  **Modify Dispatch Logic**: Add a new `elif` branch in `_process_file_content` within `llm_food/app.py` to call your new function when `pdf_backend_choice` matches your new strategy's name.
+    ```python
+    # llm_food/app.py (inside _process_file_content)
+    # ...
+    elif pdf_backend_choice == "mynewpdfparser":
+        texts_list = await asyncio.to_thread(_process_pdf_mynewpdfparser_sync, content)
+    # ...
+    ```
+4.  **Handle Imports**: Add conditional imports for any new libraries in `llm_food/app.py` if needed.
+
+## Conclusion
+
+The `PDFProcessingStrategy (Synchronous)` in `llm-food` provides a flexible and configurable way to handle PDF-to-Markdown conversion for single-file, synchronous requests via the `/convert` endpoint. By leveraging the Strategy design pattern through environment variable configuration (`PDF_BACKEND`) and dynamic dispatch in `_process_file_content`, users can choose the PDF processing backend (Gemini, `pymupdf4llm`, `pypdf2`) that best fits their specific needs regarding quality, speed, cost, and licensing. This approach ensures that the PDF handling capabilities of `llm-food` can adapt and evolve without requiring changes to the core API structure.
+
+In the next chapter, we will explore the [TaskStateRepository (DuckDB)](taskstaterepository__duckdb_.mdc), which is crucial for managing the state of asynchronous batch jobs.
+
+Next: [TaskStateRepository (DuckDB)](taskstaterepository__duckdb_.mdc)
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

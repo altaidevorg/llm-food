@@ -8,7 +8,16 @@ def get_pdf_backend():
 
 """Configuration and environment variables"""
 
-DEFAULT_GEMINI_OCR_PROMPT = """OCR this document to Markdown with text formatting such as bold, italic, headings, tables, numbered and bulleted lists properly rendered in Markdown Do not suround the out with Markdown fences. Preserve as much content as possible, such as headings, tables, lists. etc. Do not add any preamble or additional explanation of any other kind --simply output the well-formatted text output in Markdown."""
+DEFAULT_GEMINI_OCR_PROMPT = """OCR this document to Markdown with text formatting such as bold, italic, headings, tables, numbered and bulleted lists properly rendered in Markdown.
+
+Do not surround the output with Markdown fences.
+
+Preserve as much content as possible, such as headings, tables, lists. etc.
+
+Do not add any preamble or additional explanation of any other kind --simply output the well-formatted text output in Markdown.
+
+If the text contains complex equations, wrap them in $$...$$ for LaTeX rendering.
+"""
 
 
 def get_gemini_prompt():
