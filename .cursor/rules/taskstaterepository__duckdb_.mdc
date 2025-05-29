@@ -1,0 +1,271 @@
+---
+description: llm-food project: TaskStateRepository (DuckDB) for persistent batch job state management using local DuckDB.
+globs: llm_food/app.py
+alwaysApply: false
+---
+# Chapter 7: TaskStateRepository (DuckDB)
+
+In Chapter 6, [PDFProcessingStrategy (Synchronous)](pdfprocessingstrategy__synchronous_.mdc), we detailed the synchronous PDF processing strategies. Now, we turn to the persistence layer critical for the asynchronous batch operations discussed in [BatchJobOrchestrator](batchjoborchestrator.mdc): the `TaskStateRepository (DuckDB)`. This repository forms the persistence backbone for managing the state of asynchronous batch jobs within the `llm-food` project.
+
+## Motivation and Purpose
+
+The primary technical problem solved by the `TaskStateRepository` is the **reliable tracking of long-running, potentially multi-stage asynchronous operations**. When dealing with batch jobs that might involve processing hundreds of files, interacting with external APIs (like Gemini), and taking significant time to complete, it's crucial to have a durable way to store and manage the state of these operations. Without such a persistence layer, server restarts or unexpected failures could lead to loss of job progress and an inability to report status or retrieve results.
+
+The `TaskStateRepository` utilizes a local DuckDB database to:
+- Store information about overall batch jobs (`batch_jobs` table).
+- Track details of Gemini API calls for PDF processing (`gemini_pdf_batch_sub_jobs` table).
+- Manage the status of individual file or page-level tasks (`file_tasks` table).
+- Provide functions for schema initialization, record insertion, status updates (e.g., 'pending', 'processing', 'completed', 'failed'), and querying job details.
+
+DuckDB was chosen for its simplicity (file-based, embedded), SQL interface, and ease of integration into a Python application like `llm-food`. It provides sufficient durability and querying capabilities for the project's needs.
+
+**Central Use Case:**
+The [BatchJobOrchestrator](batchjoborchestrator.mdc) receives a request to the `/batch` endpoint with multiple files.
+1.  It immediately creates a record in the `batch_jobs` table with a unique `job_id` and 'pending' status.
+2.  For each PDF file group destined for Gemini, it creates a record in `gemini_pdf_batch_sub_jobs`.
+3.  For each individual file (or PDF page processed by Gemini), it creates a record in the `file_tasks` table.
+4.  As background tasks process these files/pages, they update the `status`, `gcs_output_markdown_uri`, or `error_message` fields in the respective `file_tasks` and `gemini_pdf_batch_sub_jobs` records.
+5.  The overall progress (`overall_processed_count`, `overall_failed_count`) and status of the main job in `batch_jobs` are updated.
+6.  Clients polling the `/status/{task_id}` endpoint trigger queries against these tables to retrieve the current state.
+7.  Once a job is 'completed' or 'completed_with_errors', the `/batch/{task_id}` endpoint queries `file_tasks` for `gcs_output_markdown_uri` to fetch and return results.
+
+This durable state management is critical for reliability and for providing informative feedback to users about their batch jobs.
+
+## Core Component: Database Schema
+
+The repository's structure is defined by its database schema, implemented using SQL `CREATE TABLE` statements within DuckDB. The primary logic for schema initialization and interaction resides in `llm_food/app.py`.
+
+### 1. `batch_jobs` Table
+Stores metadata for each overarching batch job.
+- **Purpose:** Tracks the overall status and summary of a batch request initiated via the `/batch` endpoint.
+- **Key Columns:**
+  - `job_id` (VARCHAR, PK): Unique identifier for the batch job.
+  - `output_gcs_path` (VARCHAR): The GCS path where outputs should be stored.
+  - `status` (VARCHAR): Overall status (e.g., 'pending', 'processing', 'completed', 'completed_with_errors', 'failed_catastrophic').
+  - `submitted_at` (TIMESTAMP): When the job was submitted.
+  - `total_input_files` (INTEGER): Total number of files in the batch.
+  - `overall_processed_count` (INTEGER): Count of successfully processed files.
+  - `overall_failed_count` (INTEGER): Count of failed files.
+  - `last_updated_at` (TIMESTAMP): Timestamp of the last update to this job record.
+
+### 2. `gemini_pdf_batch_sub_jobs` Table
+Stores details specific to batch processing of PDFs using the Google Gemini API.
+- **Purpose:** Tracks a single Gemini Batch API operation, which might process images derived from multiple PDF files or many pages.
+- **Key Columns:**
+  - `gemini_batch_sub_job_id` (VARCHAR, PK): Unique ID for this sub-job.
+  - `batch_job_id` (VARCHAR, FK): Links to the main `batch_jobs.job_id`.
+  - `gemini_api_job_name` (VARCHAR): The job name returned by the Gemini API.
+  - `status` (VARCHAR): Status of this sub-job (e.g., 'pending_preparation', 'submitting_to_gemini', 'JOB_STATE_SUCCEEDED', 'failed_gemini_job_JOB_STATE_FAILED').
+  - `payload_gcs_uri` (VARCHAR): GCS URI of the `payload.jsonl` sent to Gemini.
+  - `gemini_output_gcs_uri_prefix` (VARCHAR): GCS prefix where Gemini writes its results.
+  - `total_pdf_pages_for_batch` (INTEGER): Total pages submitted in this Gemini batch.
+  - `processed_pdf_pages_count` (INTEGER): Successfully processed pages by Gemini.
+  - `failed_pdf_pages_count` (INTEGER): Failed pages in this Gemini batch.
+  - `error_message` (VARCHAR): Any error messages.
+  - `created_at` (TIMESTAMP), `updated_at` (TIMESTAMP).
+
+### 3. `file_tasks` Table
+Stores the state of individual file processing tasks within a batch job. For PDFs processed by Gemini, each page might initially be a separate file task.
+- **Purpose:** Granular tracking of each file (or PDF page) part of a batch job.
+- **Key Columns:**
+  - `file_task_id` (VARCHAR, PK): Unique identifier for this specific file task.
+  - `batch_job_id` (VARCHAR, FK): Links to `batch_jobs.job_id`.
+  - `gemini_batch_sub_job_id` (VARCHAR, FK, nullable): Links to `gemini_pdf_batch_sub_jobs` if this task is for a PDF page processed via Gemini.
+  - `original_filename` (VARCHAR): The original name of the file.
+  - `file_type` (VARCHAR): E.g., '.docx', 'pdf_page'.
+  - `status` (VARCHAR): Status of this task (e.g., 'pending', 'processing', 'image_uploaded_to_gcs', 'completed', 'failed').
+  - `gcs_input_image_uri` (VARCHAR, nullable): For PDF pages, GCS URI of the image sent to Gemini.
+  - `gcs_output_markdown_uri` (VARCHAR, nullable): GCS URI of the final Markdown file (for successfully processed non-PDFs, or the aggregated Markdown for successfully processed PDFs).
+  - `page_number` (INTEGER, nullable): For PDF pages.
+  - `gemini_request_id` (VARCHAR, nullable): The 'id' used in `payload.jsonl` for this specific PDF page if processed via Gemini.
+  - `error_message` (VARCHAR, nullable): Error message if this task failed.
+  - `created_at` (TIMESTAMP), `updated_at` (TIMESTAMP).
+
+## Key Operations and Usage
+
+All database interactions occur through DuckDB's Python client, using simple SQL queries.
+
+### 1. Schema Initialization
+The database schema is created or verified at application startup.
+**Function:** `initialize_db_schema()` in `llm_food/app.py`.
+```python
+# llm_food/app.py
+def initialize_db_schema():
+    con = get_db_connection()
+    try:
+        # Main batch jobs table
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS batch_jobs (
+                job_id VARCHAR PRIMARY KEY,
+                output_gcs_path VARCHAR NOT NULL,
+                status VARCHAR NOT NULL,
+                # ... other columns ...
+                last_updated_at TIMESTAMP
+            )
+        """)
+        # gemini_pdf_batch_sub_jobs table
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS gemini_pdf_batch_sub_jobs (
+                gemini_batch_sub_job_id VARCHAR PRIMARY KEY,
+                batch_job_id VARCHAR NOT NULL REFERENCES batch_jobs(job_id),
+                # ... other columns ...
+                updated_at TIMESTAMP
+            )
+        """)
+        # file_tasks table
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS file_tasks (
+                file_task_id VARCHAR PRIMARY KEY,
+                batch_job_id VARCHAR NOT NULL REFERENCES batch_jobs(job_id),
+                gemini_batch_sub_job_id VARCHAR REFERENCES gemini_pdf_batch_sub_jobs(gemini_batch_sub_job_id),
+                # ... other columns ...
+                updated_at TIMESTAMP
+            )
+        """)
+    finally:
+        con.close()
+
+# Call initialization at startup
+initialize_db_schema()
+```
+- This function uses `CREATE TABLE IF NOT EXISTS` to ensure tables are present without causing errors on subsequent starts.
+
+### 2. Getting a Database Connection
+A new connection is typically obtained for each request or background task that needs DB access.
+**Function:** `get_db_connection()` in `llm_food/app.py`.
+**Configuration:** The database file path is specified by `DUCKDB_FILE` in `llm_food/config.py`.
+```python
+# llm_food/app.py
+from .config import DUCKDB_FILE # DUCKDB_FILE = os.getenv("DUCKDB_FILE", "llm_food_jobs.duckdb")
+
+def get_db_connection():
+    return duckdb.connect(DUCKDB_FILE)
+
+# Usage:
+# con = get_db_connection()
+# try:
+#     # ... DB operations ...
+#     con.commit() # For write operations
+# finally:
+#     con.close()
+```
+- **Explanation:** `duckdb.connect()` establishes a connection to the specified database file. It's crucial to close connections (`con.close()`) in a `finally` block to release resources.
+
+### 3. Record Insertion (Creating Jobs/Tasks)
+When a new batch job or task starts, records are inserted into the appropriate tables.
+**Example:** Creating a `batch_jobs` record in the `/batch` endpoint handler.
+```python
+# llm_food/app.py (Simplified from batch_files_upload)
+# async def batch_files_upload(...):
+#     main_batch_job_id = str(uuid.uuid4())
+#     current_time = datetime.utcnow()
+#     total_files_count = len(pdf_files_data_for_batch) + len(non_pdf_files_for_individual_processing)
+#
+#     con = get_db_connection()
+#     try:
+#         con.execute(
+#             "INSERT INTO batch_jobs (job_id, output_gcs_path, status, submitted_at, total_input_files, last_updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+#             (
+#                 main_batch_job_id,
+#                 output_gcs_path,
+#                 "pending", # Initial status
+#                 current_time,
+#                 total_files_count,
+#                 current_time,
+#             ),
+#         )
+#         con.commit() # Persist changes
+#         # ... logic to create file_tasks and gemini_pdf_batch_sub_jobs ...
+#     finally:
+#         con.close()
+```
+- **Explanation:** An `INSERT INTO` SQL statement is used with parameterized queries (`?`) to prevent SQL injection and handle data type conversions. `con.commit()` saves the changes to the database.
+
+### 4. Status Updates
+As tasks progress, their status and other relevant fields are updated.
+**Example:** Updating a `file_tasks` record in `_process_single_non_pdf_file_and_upload`.
+```python
+# llm_food/app.py (Simplified from _process_single_non_pdf_file_and_upload)
+# async def _process_single_non_pdf_file_and_upload(... file_task_id: str, ...):
+#     con = get_db_connection()
+#     try:
+#         # Mark as processing
+#         con.execute(
+#             "UPDATE file_tasks SET status = ?, updated_at = ? WHERE file_task_id = ?",
+#             ("processing", datetime.utcnow(), file_task_id),
+#         )
+#         con.commit()
+#
+#         # ... processing logic ...
+#         # If successful:
+#         gcs_output_url = "gs://bucket/path/to/output.md"
+#         con.execute(
+#             "UPDATE file_tasks SET status = ?, gcs_output_markdown_uri = ?, updated_at = ? WHERE file_task_id = ?",
+#             ("completed", gcs_output_url, datetime.utcnow(), file_task_id),
+#         )
+#         # Update overall_processed_count in batch_jobs
+#         con.execute(
+#             "UPDATE batch_jobs SET overall_processed_count = overall_processed_count + 1, last_updated_at = ? WHERE job_id = ?",
+#             (datetime.utcnow(), main_batch_job_id),
+#         )
+#         con.commit()
+#     # ... error handling and finally block with con.close() ...
+```
+- **Explanation:** `UPDATE` statements modify existing records. Counters in parent tables (like `batch_jobs.overall_processed_count`) are often incremented atomically.
+
+### 5. Querying Job Details
+Endpoints like `/status/{task_id}` and `/batch/{task_id}` query the database to report progress or retrieve results.
+**Example:** Fetching status in the `/status/{task_id}` endpoint.
+```python
+# llm_food/app.py (Simplified from status endpoint)
+# def status(task_id: str):
+#     con = get_db_connection()
+#     try:
+#         job_status_row = con.execute(
+#             "SELECT * FROM batch_jobs WHERE job_id = ?", (task_id,)
+#         ).fetchone()
+#         # ... check if job_status_row exists ...
+#
+#         gemini_sub_jobs_rows = con.execute(
+#             "SELECT * FROM gemini_pdf_batch_sub_jobs WHERE batch_job_id = ?", (task_id,)
+#         ).fetchall()
+#
+#         file_tasks_rows = con.execute(
+#             "SELECT original_filename, file_type, status, gcs_output_markdown_uri, error_message, page_number FROM file_tasks WHERE batch_job_id = ?", (task_id,)
+#         ).fetchall()
+#
+#         # ... construct response from fetched data (see APIDataModels (Pydantic)) ...
+#         # return BatchJobStatusResponse(...)
+#     finally:
+#         con.close()
+```
+- **Explanation:** `SELECT` statements retrieve data. `fetchone()` gets a single record, while `fetchall()` gets multiple. The results are then typically mapped to [APIDataModels (Pydantic)](apidatamodels__pydantic_.mdc) for the API response.
+
+## Interaction with BatchJobOrchestrator
+
+The `TaskStateRepository` is indispensable for the [BatchJobOrchestrator](batchjoborchestrator.mdc). The orchestrator's logic, primarily found in the `/batch` endpoint handler and its associated background task functions (`_process_single_non_pdf_file_and_upload`, `_run_gemini_pdf_batch_conversion`), constantly interacts with the DuckDB repository to:
+- **Create Initial Records:** As soon as a batch job is accepted, a main `batch_jobs` record is created. Subsequently, `gemini_pdf_batch_sub_jobs` and `file_tasks` records are generated.
+- **Update Statuses Progressively:** Throughout the lifecycle of file processing (e.g., image upload to GCS for PDF pages, submission to Gemini, actual conversion), the `status` and other relevant fields (`gcs_input_image_uri`, `gemini_api_job_name`) are updated in the `file_tasks` and `gemini_pdf_batch_sub_jobs` tables.
+- **Log Results and Errors:** Upon completion or failure of a task, the `gcs_output_markdown_uri` or `error_message` is recorded.
+- **Aggregate Progress:** Counters like `overall_processed_count`, `overall_failed_count` in `batch_jobs`, and similar counts in `gemini_pdf_batch_sub_jobs` are updated.
+- **Finalize Job Status:** The `_check_and_finalize_batch_job_status` function (in `llm_food/app.py`) is crucial. It queries the counts of completed and failed tasks to determine if the overall batch job can be marked as 'completed' or 'completed_with_errors'.
+
+This tight coupling ensures that the state of complex, multi-step asynchronous processes is always durably recorded and queryable.
+
+## Considerations
+
+- **Locality:** DuckDB stores its data in a single file on the local filesystem (`llm_food_jobs.duckdb` by default). This is simple for single-instance deployments but means the state is not inherently shared if `llm-food` were deployed across multiple server instances without a shared filesystem for the DB file.
+- **Concurrency:** DuckDB allows multiple connections from the same process. The `llm-food` application typically creates a new connection per request or background task (`get_db_connection()`). DuckDB handles internal locking to manage concurrent access. For the expected workload of `llm-food`, this approach is generally sufficient.
+- **Backup and Recovery:** Being a single file, backup can be as simple as copying the `.duckdb` file. Recovery involves restoring this file.
+- **Scalability:** For extremely high-volume concurrent writes or very large datasets, a dedicated, server-based database system (e.g., PostgreSQL) might offer better performance and scalability features. However, DuckDB is surprisingly capable and often sufficient for many applications.
+
+## Conclusion
+
+The `TaskStateRepository (DuckDB)` is a vital component in the `llm-food` architecture, providing the necessary persistence layer for robustly managing the state of asynchronous batch document conversion jobs. By leveraging DuckDB's simplicity and SQL capabilities, it enables reliable tracking of progress, results, and errors, ensuring that long-running operations can be monitored and their outcomes retrieved even in the face of potential interruptions. Its clear schema and straightforward SQL-based operations make it an effective solution for state management within the project.
+
+This concludes our exploration of the core components of the `llm-food` project. You now have a comprehensive understanding of its API endpoints, data models, synchronous and asynchronous processing services, PDF handling strategies, and the crucial role of the TaskStateRepository in managing job states.
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

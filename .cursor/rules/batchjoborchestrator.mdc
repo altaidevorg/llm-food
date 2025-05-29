@@ -1,0 +1,204 @@
+---
+description: BatchJobOrchestrator in llm-food, handling efficient batch processing of files
+globs: llm_food/app.py
+alwaysApply: false
+---
+# Batch Job Orchestrator
+
+The BatchJobOrchestrator in llm-food manages the processing of multiple files efficiently, using temporary files and thread pool execution for optimal performance.
+
+## Core Components
+
+### 1. Batch Job Creation
+```python
+def batch_files_upload(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile],
+    output_gcs_path: str,
+):
+    """
+    Non-async endpoint that immediately writes files to disk and queues processing tasks.
+    Runs in FastAPI's thread pool to avoid blocking the event loop.
+    """
+    # Create temporary files
+    temp_files = []
+    for f in files:
+        temp_file = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+        temp_files.append(temp_file.name)
+        shutil.copyfileobj(f.file, temp_file)
+```
+
+### 2. PDF Batch Processing
+```python
+def _run_gemini_pdf_batch_conversion(
+    pdf_inputs_list: List[tuple[str, str]],  # (filename, temp_file_path)
+    output_gcs_path_str: str,
+    main_batch_job_id: str,
+    gemini_batch_sub_job_id: str,
+):
+    """
+    Non-async function for processing PDFs using Gemini Batch API.
+    Runs in thread pool for efficient execution.
+    """
+    # Initialize clients
+    storage_client = storage.Client(...)
+    gemini_client = get_gemini_client()
+
+    # Process PDFs and create page images
+    for original_pdf_filename, temp_file_path in pdf_inputs_list:
+        with open(temp_file_path, "rb") as pdf_file:
+            page_images = convert_from_bytes(pdf_file.read())
+        
+        # Upload images and create tasks
+        for page_num, page_image in enumerate(page_images):
+            # Save to GCS and update database
+            ...
+
+    # Submit Gemini batch job
+    gemini_job = gemini_client.batches.create(...)
+
+    # Process results and update database
+    if gemini_job.state == JobState.JOB_STATE_SUCCEEDED:
+        # Process predictions and create final markdown files
+        ...
+```
+
+### 3. Non-PDF Processing
+```python
+def _process_single_non_pdf_file_and_upload(
+    temp_file_path: str,
+    file_ext: str,
+    original_filename: str,
+    ...
+):
+    """
+    Non-async function for processing individual non-PDF files.
+    Runs in thread pool for efficient execution.
+    """
+    # Read from temporary file
+    with open(temp_file_path, "rb") as f:
+        content_bytes = f.read()
+
+    # Process content and upload results
+    markdown_texts = _process_file_content(...)
+    
+    # Upload to GCS and update database
+    ...
+
+    # Clean up temporary file
+    os.unlink(temp_file_path)
+```
+
+## Key Features
+
+1. **Efficient File Handling:**
+   - Immediate writing to temporary files
+   - No memory accumulation
+   - Proper cleanup after processing
+
+2. **Thread Pool Execution:**
+   - Non-async processing functions
+   - Runs in FastAPI's thread pool
+   - Avoids blocking the event loop
+
+3. **Status Tracking:**
+   - Database updates for progress
+   - Error handling and reporting
+   - Final status updates
+
+4. **Resource Management:**
+   - Proper client initialization
+   - Connection pooling
+   - Temporary file cleanup
+
+## Database Schema
+
+The orchestrator uses three main tables:
+
+1. **batch_jobs:**
+   - Overall job status
+   - File counts and progress
+   - Output path information
+
+2. **gemini_pdf_batch_sub_jobs:**
+   - Gemini batch job details
+   - PDF processing status
+   - Error tracking
+
+3. **file_tasks:**
+   - Individual file/page status
+   - Processing results
+   - Error messages
+
+## Status Management
+
+```python
+def _check_and_finalize_batch_job_status(
+    main_batch_job_id: str,
+    con: duckdb.DuckDBPyConnection,
+):
+    """
+    Non-async function for checking and updating job status.
+    Called by background tasks to update overall job status.
+    """
+    # Check completion status
+    job_info = con.execute(
+        "SELECT total_input_files, overall_processed_count, overall_failed_count, status FROM batch_jobs WHERE job_id = ?",
+        (main_batch_job_id,)
+    ).fetchone()
+
+    # Update status if all files processed
+    if (processed_count + failed_count) >= total_files:
+        new_status = "completed_with_errors" if failed_count > 0 else "completed"
+        con.execute(
+            "UPDATE batch_jobs SET status = ? WHERE job_id = ?",
+            (new_status, main_batch_job_id)
+        )
+```
+
+## Error Handling
+
+```python
+def _record_pdf_failure(
+    con: duckdb.DuckDBPyConnection,
+    batch_job_id: str,
+    pdf_filename: str,
+    error_message: str,
+    current_time: datetime,
+):
+    """
+    Helper function for consistent error recording.
+    Updates both file_tasks and batch_jobs tables.
+    """
+    file_task_id = str(uuid.uuid4())
+    con.execute(
+        "INSERT INTO file_tasks (...) VALUES (...)",
+        (file_task_id, batch_job_id, pdf_filename, "failed", error_message, ...)
+    )
+    con.execute(
+        "UPDATE batch_jobs SET overall_failed_count = overall_failed_count + 1",
+        (batch_job_id,)
+    )
+```
+
+## Best Practices
+
+1. **Resource Management:**
+   - Always clean up temporary files
+   - Close database connections properly
+   - Release client resources
+
+2. **Error Handling:**
+   - Consistent error recording
+   - Proper status updates
+   - Cleanup on failure
+
+3. **Performance:**
+   - Use thread pool for CPU-intensive tasks
+   - Avoid memory accumulation
+   - Efficient database operations
+
+4. **Status Tracking:**
+   - Regular status updates
+   - Detailed error messages
+   - Progress monitoring 

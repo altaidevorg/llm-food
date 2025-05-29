@@ -1,0 +1,306 @@
+---
+description: llm-food project: LLMFoodClient, an async Python client for server API interaction, parsing responses into Pydantic models.
+globs: llm_food/client.py
+alwaysApply: false
+---
+# Chapter 3: LLMFoodClient
+
+In the previous chapter, [APIDataModels (Pydantic)](apidatamodels__pydantic_.mdc), we explored the Pydantic models that define the structure of data exchanged with the `llm-food` server. Now, we will examine the `LLMFoodClient`, an asynchronous Python client library designed to simplify programmatic interaction with the server's API, making direct use of these data models.
+
+## Motivation and Purpose
+
+The `LLMFoodClient` solves the problem of **abstracting away the complexities of direct HTTP communication** with the `llm-food` server. Manually constructing HTTP requests, handling authentication, managing asynchronous operations, parsing JSON responses, and implementing robust error handling can be tedious and error-prone for developers wanting to integrate `llm-food` services into their applications.
+
+The `LLMFoodClient` acts as a **Facade** for the server's API (defined by [FastAPIServerEndpoints](fastapiserverendpoints.mdc)). It provides a clean, high-level, asynchronous interface with methods that directly correspond to the server's API endpoints. Key responsibilities include:
+- Asynchronous HTTP request construction and execution using `httpx`.
+- Optional API token-based authentication.
+- Deserialization of JSON responses into the Pydantic models defined in [APIDataModels (Pydantic)](apidatamodels__pydantic_.mdc) (e.g., `ConversionResponse`, `BatchJobStatusResponse`).
+- Standardized error handling by raising a custom `LLMFoodClientError` for API or network issues.
+- Providing type-hinted methods for better developer experience and static analysis.
+
+This abstraction significantly simplifies server communication, promotes ease of integration, and serves as the core foundation for the `llm-food` Command Line Interface (CLI).
+
+**Central Use Case:** A developer needs to write a Python script to automatically upload a `.docx` file to the `llm-food` server for conversion to Markdown and then process the returned Markdown content. Instead of using a raw HTTP library, they can use `LLMFoodClient` for a more straightforward and type-safe interaction.
+
+All client logic is encapsulated within `llm_food/client.py`.
+
+## Core Components and Structure
+
+The `LLMFoodClient` is primarily composed of:
+
+1.  **`LLMFoodClient` Class:** The main class providing all client functionalities.
+    *   **Initialization (`__init__`)**: Takes the `base_url` of the `llm-food` server and an optional `api_token` for authentication.
+2.  **`LLMFoodClientError` Exception:** A custom exception class raised for errors encountered during client operations, such as HTTP errors or request issues. It often includes the HTTP status code and response text from the server for better diagnostics.
+3.  **Private `_request` Method:** An internal helper method responsible for:
+    *   Constructing the full request URL.
+    *   Adding necessary headers (e.g., `Accept: application/json`, `Authorization: Bearer <token>`).
+    *   Making the actual asynchronous HTTP request using `httpx.AsyncClient`.
+    *   Performing initial response validation (e.g., `response.raise_for_status()`).
+    *   Wrapping `httpx` exceptions into `LLMFoodClientError`.
+4.  **Public API Methods:** Asynchronous methods that mirror the server endpoints:
+    *   `convert_file(file_path: str) -> ConversionResponse`
+    *   `convert_url(url_to_convert: str) -> ConversionResponse`
+    *   `create_batch_job(file_paths: List[str], output_gcs_path: str) -> Dict[str, Any]`
+    *   `get_detailed_batch_job_status(task_id: str) -> BatchJobStatusResponse`
+    *   `get_batch_job_results(task_id: str) -> BatchJobOutputResponse`
+
+## How to Use `LLMFoodClient`
+
+Using the `LLMFoodClient` involves instantiating it and then calling its `async` methods.
+
+**1. Initialization:**
+
+```python
+# llm_food/client.py
+from typing import Optional
+# ... other imports
+
+class LLMFoodClient:
+    def __init__(self, base_url: str, api_token: Optional[str] = None):
+        self.base_url = base_url.rstrip("/")
+        self.api_token = api_token
+        self.headers = {"Accept": "application/json"}
+        if self.api_token:
+            self.headers["Authorization"] = f"Bearer {self.api_token}"
+```
+- `base_url`: The root URL of the `llm-food` server (e.g., `http://localhost:8000`).
+- `api_token` (optional): If the server requires authentication, provide the API token here.
+
+**Example Instantiation:**
+```python
+import asyncio
+from llm_food.client import LLMFoodClient, LLMFoodClientError
+from llm_food.models import ConversionResponse # From apidatamodels__pydantic_.mdc
+
+async def run_conversion():
+    client = LLMFoodClient(
+        base_url="http://localhost:8000",
+        api_token="your_secret_api_token" # Optional
+    )
+    # ... use client methods
+```
+
+**2. Calling API Methods:**
+
+Each public method is asynchronous and needs to be `await`ed. They return Pydantic model instances (or a dictionary for `create_batch_job`) on success or raise `LLMFoodClientError` on failure.
+
+**Example: Converting a File (Central Use Case)**
+
+```python
+# Continuing from run_conversion() above
+
+async def run_conversion():
+    client = LLMFoodClient(base_url="http://localhost:8000") # No token example
+    try:
+        file_path = "path/to/your/document.docx"
+        # response_model is ConversionResponse from apidatamodels__pydantic_.mdc
+        conversion_result: ConversionResponse = await client.convert_file(file_path)
+        
+        print(f"Successfully converted: {conversion_result.filename}")
+        for page_content in conversion_result.texts:
+            print(page_content[:100] + "...") # Print first 100 chars of each page
+        
+    except LLMFoodClientError as e:
+        print(f"Client Error: {e}")
+        if e.response_text:
+            print(f"Server Response: {e.response_text}")
+    except FileNotFoundError:
+        print(f"Error: Input file not found at {file_path}")
+
+# asyncio.run(run_conversion())
+```
+- **Input:** `file_path` (string path to the local file).
+- **Output (Success):** An instance of `ConversionResponse` (defined in [APIDataModels (Pydantic)](apidatamodels__pydantic_.mdc)), containing `filename`, `content_hash`, and `texts` (list of converted content strings).
+- **Output (Failure):** Raises `LLMFoodClientError`.
+
+## Deep Dive: `convert_file` Method Internals
+
+Let's trace the execution when `await client.convert_file("mydoc.docx")` is called:
+
+**1. Client-Side `convert_file` Method (`llm_food/client.py`):**
+```python
+# llm_food/client.py
+# class LLMFoodClient:
+# ...
+    async def convert_file(
+        self,
+        file_path: str,
+    ) -> ConversionResponse: # Returns a Pydantic model
+        endpoint = "/convert"
+        try:
+            file_name = os.path.basename(file_path)
+            with open(file_path, "rb") as f:
+                files_payload = { # For multipart/form-data
+                    "file": (file_name, BytesIO(f.read()), "application/octet-stream")
+                }
+                # Calls the internal _request method
+                response = await self._request("POST", endpoint, files=files_payload)
+            # Parses JSON into ConversionResponse Pydantic model
+            return ConversionResponse(**response.json())
+        except FileNotFoundError:
+            raise LLMFoodClientError(f"File not found: {file_path}")
+        # ... other exception handling ...
+```
+- It prepares the `/convert` endpoint.
+- Opens the specified `file_path` in binary read mode (`"rb"`).
+- Constructs a `files_payload` dictionary suitable for `httpx` to send as `multipart/form-data`. The key `"file"` matches what the [FastAPIServerEndpoints](fastapiserverendpoints.mdc) expects.
+- Calls the internal `_request` method.
+- If `_request` is successful, it parses the JSON response from the server (`response.json()`) and unpacks it into a `ConversionResponse` Pydantic model. This provides data validation and type-safe access to response fields.
+
+**2. Internal `_request` Method (`llm_food/client.py`):**
+```python
+# llm_food/client.py
+# class LLMFoodClient:
+# ...
+    async def _request(self, method: str, endpoint: str, **kwargs) -> httpx.Response:
+        url = f"{self.base_url}{endpoint}"
+        request_headers = self.headers.copy() # Includes Accept and Authorization
+        if "headers" in kwargs: # Allows overriding/adding headers per-request
+            request_headers.update(kwargs.pop("headers"))
+
+        async with httpx.AsyncClient() as client: # Create an async HTTP client session
+            try:
+                response = await client.request(
+                    method, url, headers=request_headers, **kwargs
+                )
+                response.raise_for_status() # Raises HTTPStatusError for 4xx/5xx
+                return response
+            except httpx.HTTPStatusError as e:
+                # Extract error details for LLMFoodClientError
+                error_detail = e.response.text # Default to full response text
+                # ... (try to parse JSON detail if available) ...
+                raise LLMFoodClientError(
+                    # ...
+                ) from e
+            except httpx.RequestError as e: # Network errors, DNS failures etc.
+                raise LLMFoodClientError(
+                    # ...
+                ) from e
+```
+- Constructs the full URL (e.g., `http://localhost:8000/convert`).
+- Uses the `self.headers` (which includes `Authorization` if an API token was provided during client initialization).
+- An `httpx.AsyncClient` is used to perform the actual HTTP `POST` request asynchronously.
+- `response.raise_for_status()`: If the server returns an HTTP error status (4xx or 5xx), `httpx` raises an `HTTPStatusError`.
+- `httpx` errors are caught and re-raised as `LLMFoodClientError`, including `status_code` and `response_text` from the server for easier debugging.
+- If the request is successful (HTTP 2xx), the raw `httpx.Response` object is returned to the calling public method (e.g., `convert_file`).
+
+## Deep Dive: `create_batch_job` Method Internals
+
+This method handles uploading multiple files for asynchronous batch processing.
+
+**Client-Side Usage Example:**
+```python
+# import asyncio, os
+# from llm_food.client import LLMFoodClient, LLMFoodClientError
+
+async def run_batch_creation():
+    client = LLMFoodClient(base_url="http://localhost:8000")
+    try:
+        file_paths = ["./docs/report.pdf", "./data/notes.docx"]
+        output_gcs_path = "gs://my-llm-food-bucket/batch_outputs/"
+        
+        # Server returns a dict like {"task_id": "..."}
+        batch_creation_response: dict = await client.create_batch_job(
+            file_paths, output_gcs_path
+        )
+        print(f"Batch job created with Task ID: {batch_creation_response.get('task_id')}")
+        
+    except LLMFoodClientError as e:
+        print(f"Client Error creating batch job: {e}")
+    except FileNotFoundError as e:
+        print(f"Error: Input file not found: {e.filename}")
+        
+# asyncio.run(run_batch_creation())
+```
+
+**Internal Implementation (`llm_food/client.py`):**
+```python
+# llm_food/client.py
+# class LLMFoodClient:
+# ...
+    async def create_batch_job(
+        self,
+        file_paths: List[str],
+        output_gcs_path: str,
+    ) -> Dict[str, Any]: # Returns a dictionary, not a Pydantic model here
+        endpoint = "/batch"
+        opened_files_objects = []
+        try:
+            files_payload_for_httpx = []
+            for file_path in file_paths:
+                # ... (file existence check) ...
+                file_name = os.path.basename(file_path)
+                f_obj = open(file_path, "rb")
+                opened_files_objects.append(f_obj) # Track to close later
+                # Server expects a list of files under the key 'files'
+                files_payload_for_httpx.append(
+                    ("files", (file_name, f_obj, "application/octet-stream"))
+                )
+            
+            data_payload = {"output_gcs_path": output_gcs_path} # Form data
+
+            response = await self._request(
+                "POST", endpoint, files=files_payload_for_httpx, data=data_payload
+            )
+            return response.json() # Server returns a simple JSON dict
+        # ... (error handling and finally block to close files) ...
+        finally:
+            for f_obj in opened_files_objects:
+                if not f_obj.closed: f_obj.close()
+```
+- Prepares the `/batch` endpoint.
+- Iterates through `file_paths`, opens each file in binary mode, and prepares a list of tuples for `httpx`'s `files` parameter. This is how multiple files are sent in a single `multipart/form-data` request under the same field name (`files`).
+- The `output_gcs_path` is sent as part of the `data` payload (form fields).
+- Calls `_request`. The server's `/batch` endpoint returns a simple JSON object like `{"task_id": "..."}` (as seen in [FastAPIServerEndpoints](fastapiserverendpoints.mdc)), so `response.json()` is returned directly as a `Dict[str, Any]`.
+- A `finally` block ensures all opened file objects are closed, even if errors occur.
+
+## Response Parsing and Pydantic Models
+
+For methods like `convert_file`, `get_detailed_batch_job_status`, and `get_batch_job_results`, the client parses the successful JSON response from `_request` directly into the corresponding Pydantic models from [APIDataModels (Pydantic)](apidatamodels__pydantic_.mdc).
+Example: `return ConversionResponse(**response.json())`
+This leverages Pydantic's validation capabilities on the client side as well, ensuring that the data received from the server matches the expected structure. If the server's response structure deviates unexpectedly (and Pydantic validation fails), a `pydantic.ValidationError` would be raised.
+
+## Authentication
+
+If an `api_token` is provided when `LLMFoodClient` is instantiated:
+```python
+# llm_food/client.py (within __init__)
+if self.api_token:
+    self.headers["Authorization"] = f"Bearer {self.api_token}"
+```
+This token is automatically included as a `Bearer` token in the `Authorization` header for every request made by the `_request` method. The server's authentication dependency (see [FastAPIServerEndpoints](fastapiserverendpoints.mdc)) will then validate this token.
+
+## Error Handling with `LLMFoodClientError`
+
+The custom `LLMFoodClientError` provides a consistent way for developers using the client to handle API-related issues.
+```python
+# llm_food/client.py
+class LLMFoodClientError(Exception):
+    def __init__(
+        self,
+        message: str,
+        status_code: Optional[int] = None,
+        response_text: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_text = response_text
+    # ... (__str__ method for better representation) ...
+```
+When `_request` encounters an `httpx.HTTPStatusError` (e.g., 401 Unauthorized, 404 Not Found, 500 Internal Server Error) or an `httpx.RequestError` (e.g., network connection issue), it catches these and raises an `LLMFoodClientError`. This error object conveniently packages:
+- A descriptive message.
+- The `status_code` from the HTTP response (if applicable).
+- The raw `response_text` from the server's error response (if applicable), which can be very useful for debugging.
+
+## Conclusion
+
+The `LLMFoodClient` provides a robust, developer-friendly, and asynchronous Python interface to the `llm-food` server. By abstracting HTTP complexities, handling authentication, parsing responses into [APIDataModels (Pydantic)](apidatamodels__pydantic_.mdc), and offering standardized error handling, it significantly simplifies the task of integrating `llm-food`'s document conversion capabilities into other Python applications or workflows. It serves as a practical implementation of the Facade pattern, making the server's API more accessible.
+
+Understanding `LLMFoodClient` is key to programmatically interacting with the server. The `llm-food` CLI itself is built upon this client, demonstrating its utility.
+
+Next, we will look at the server-side service responsible for handling synchronous conversions: [SynchronousConversionService](synchronousconversionservice.mdc).
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)

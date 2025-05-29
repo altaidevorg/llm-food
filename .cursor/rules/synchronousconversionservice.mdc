@@ -1,0 +1,235 @@
+---
+description: llm-food project: SynchronousConversionService for on-demand single document/URL to Markdown conversion.
+globs: 
+alwaysApply: false
+---
+# Chapter 4: SynchronousConversionService
+
+In the [LLMFoodClient](llmfoodclient.mdc) chapter, we saw how a client application can make requests to the `llm-food` server for document conversion. This chapter dives into the server-side component responsible for handling these immediate, single-file conversion requests: the `SynchronousConversionService`.
+
+## Motivation and Purpose
+
+The `SynchronousConversionService` addresses the need for a centralized, reusable, and testable component that performs on-demand conversion of single documents or URL content to Markdown. When a client sends a file or URL to the `/convert` endpoints (detailed in [FastAPIServerEndpoints](fastapiserverendpoints.mdc)) and expects an immediate Markdown response, this service's logic is invoked.
+
+Its key characteristics include:
+- **Synchronous Interaction Model:** Clients make a request and block (wait) until the conversion is complete and the Markdown result is returned. This is suitable for interactive use cases or scenarios where immediate processing is required.
+- **Dynamic Processor Selection:** It intelligently chooses the correct parsing/conversion library based on the input file's extension (e.g., PDF, DOCX, HTML).
+- **Configurable PDF Strategy:** For PDF documents, it employs a specific [PDFProcessingStrategy (Synchronous)](pdfprocessingstrategy__synchronous_.mdc), which can be configured (e.g., Gemini, pymupdf4llm, pypdf2).
+- **File Size Validation:** It incorporates logic to check file sizes against configured limits.
+- **Centralized Logic:** It encapsulates the core single-file transformation logic, making the API endpoints cleaner and the conversion process itself easier to manage and test.
+
+This service contrasts with the [BatchJobOrchestrator](batchjoborchestrator.mdc), which is designed for asynchronous processing of multiple files.
+
+**Central Use Case:** A user uploads a `.docx` file via a web interface that calls the `POST /convert` API endpoint. The `FastAPIServerEndpoints` layer receives the request, validates the file size, and then invokes the `SynchronousConversionService` logic with the file content. The service identifies it as a DOCX file, uses the `mammoth` library to convert it to HTML, then `markdownify` to convert HTML to Markdown, and returns the Markdown text. The client receives this Markdown in the HTTP response.
+
+While not a standalone class in the current codebase, the logic for the `SynchronousConversionService` is primarily encapsulated within the `_process_file_content` function and its helper processing functions (e.g., `_process_docx_sync`, `_process_pdf_pymupdf4llm_sync`) found in `llm_food/app.py`.
+
+## Key Responsibilities and Mechanisms
+
+### 1. Content Handling and Initial Processing
+The service logic is typically invoked after the [FastAPIServerEndpoints](fastapiserverendpoints.mdc) layer has received an uploaded file or fetched content from a URL.
+
+For file uploads (`POST /convert`):
+```python
+# llm_food/app.py (Simplified from convert_file_upload)
+# async def convert_file_upload(file: UploadFile = File(...)):
+#     ext = os.path.splitext(file.filename)[1].lower()
+#     content = await file.read() # Read file content into bytes
+
+#     # File size validation (see below)
+#     # ...
+
+#     pdf_backend_choice = get_pdf_backend() # Get configured PDF strategy
+
+#     # Invoke the core service logic
+#     texts_list = await _process_file_content(ext, content, pdf_backend_choice)
+
+#     # Return ConversionResponse (see APIDataModels (Pydantic))
+#     # ...
+```
+- The endpoint reads the file content into `bytes`.
+- It determines the file extension and configured PDF backend.
+- It then calls `_process_file_content`, which embodies the core of the `SynchronousConversionService`.
+
+For URL conversions (`GET /convert`):
+```python
+# llm_food/app.py (Simplified from convert_url)
+# async def convert_url(url: str = Query(...)):
+#     # ... (fetch URL content into content_bytes using httpx) ...
+#     # content_bytes = html_content.encode("utf-8")
+
+#     # For HTML, trafilatura is used directly in the endpoint handler
+#     # or _process_file_content could be extended for URLs.
+#     extracted_text = trafilatura.extract(html_content, output_format="markdown")
+#     texts_list = [extracted_text if extracted_text is not None else ""]
+#     # ... return ConversionResponse ...
+```
+- The `/convert` GET endpoint currently handles HTML URL conversion directly using `trafilatura`. The `_process_file_content` function also includes logic for HTML files if they were uploaded.
+
+### 2. File Size Validation
+Before processing, file sizes are validated (primarily for uploads) to prevent resource exhaustion. This check occurs in the API endpoint handler before delegating to the core conversion logic.
+
+```python
+# llm_food/app.py (within convert_file_upload)
+max_size = get_max_file_size_bytes() # From config
+if max_size is not None and len(content) > max_size:
+    raise HTTPException(
+        status_code=413,
+        detail=f"File size exceeds maximum allowed: {max_size / (1024 * 1024):.2f}MB."
+    )
+```
+- `get_max_file_size_bytes()` retrieves the configured limit.
+- If the `content` length exceeds this, an `HTTPException` is raised.
+
+### 3. Dynamic Processor Selection and Execution (`_process_file_content`)
+The heart of the service is the `_process_file_content` function. It acts as a dispatcher, selecting the appropriate processing function based on the file extension.
+
+**Input:**
+- `ext: str`: The file extension (e.g., `".pdf"`, `".docx"`).
+- `content: bytes`: The raw byte content of the file.
+- `pdf_backend_choice: str`: The configured PDF processing strategy (e.g., `"gemini"`, `"pymupdf4llm"`, `"pypdf2"`).
+
+**Output:**
+- `List[str]`: A list of strings, where each string is a chunk of converted Markdown (often one string per page for multi-page documents, or a single string for others).
+
+**Simplified Structure of `_process_file_content`:**
+```python
+# llm_food/app.py
+async def _process_file_content(
+    ext: str, content: bytes, pdf_backend_choice: str
+) -> List[str]:
+    texts_list: List[str] = []
+    if ext == ".pdf":
+        # PDF processing logic (see details below)
+        # ...
+    elif ext == ".docx":
+        texts_list = await asyncio.to_thread(_process_docx_sync, content)
+    elif ext == ".rtf":
+        texts_list = await asyncio.to_thread(_process_rtf_sync, content)
+    elif ext == ".pptx":
+        texts_list = await asyncio.to_thread(_process_pptx_sync, content)
+    elif ext in [".html", ".htm"]:
+        texts_list = await asyncio.to_thread(_process_html_sync, content)
+    else:
+        texts_list = ["Unsupported file type for synchronous conversion."]
+    return texts_list
+```
+- The function uses `if/elif` to route based on `ext`.
+- For most non-PDF types, it calls a specific synchronous processing helper function (e.g., `_process_docx_sync`) using `await asyncio.to_thread(...)`. This is crucial because FastAPI is an asynchronous framework, and running blocking I/O-bound or CPU-bound synchronous code directly in an `async` function would block the server's event loop. `asyncio.to_thread` executes the synchronous function in a separate thread pool.
+
+#### Specific File Type Processors:
+
+- **DOCX (`_process_docx_sync`):**
+  ```python
+  # llm_food/app.py
+  def _process_docx_sync(content_bytes: bytes) -> List[str]:
+      try:
+          doc = BytesIO(content_bytes)
+          doc_html = mammoth.convert_to_html(doc).value # mammoth converts DOCX to HTML
+          doc_md = markdownify(doc_html).strip() # markdownify converts HTML to Markdown
+          return [doc_md]
+      except Exception as e:
+          return [f"Error processing DOCX: {str(e)}"]
+  ```
+  - Uses `mammoth` to convert DOCX to HTML, then `markdownify` to get Markdown.
+
+- **RTF (`_process_rtf_sync`):**
+  ```python
+  # llm_food/app.py
+  def _process_rtf_sync(content_bytes: bytes) -> List[str]:
+      try:
+          # striprtf decodes and converts RTF to plain text
+          return [rtf_to_text(content_bytes.decode("utf-8", errors="ignore"))]
+      except Exception as e:
+          return [f"Error processing RTF: {str(e)}"]
+  ```
+  - Uses `striprtf` to convert RTF to plain text.
+
+- **PPTX (`_process_pptx_sync`):**
+  ```python
+  # llm_food/app.py
+  def _process_pptx_sync(content_bytes: bytes) -> List[str]:
+      try:
+          prs = Presentation(BytesIO(content_bytes)) # python-pptx library
+          slide_texts = []
+          for slide in prs.slides: # Iterate through slides
+              text_on_slide = "\n".join(
+                  shape.text for shape in slide.shapes if hasattr(shape, "text") # Extract text from shapes
+              )
+              if text_on_slide: slide_texts.append(text_on_slide)
+          return slide_texts if slide_texts else [""] # List of text content per slide
+      except Exception as e:
+          return [f"Error processing PPTX: {str(e)}"]
+  ```
+  - Uses `python-pptx` to extract text from each slide.
+
+- **HTML (`_process_html_sync`):**
+  ```python
+  # llm_food/app.py
+  def _process_html_sync(content_bytes: bytes) -> List[str]:
+      try:
+          # trafilatura extracts main content and converts to Markdown
+          extracted_text = trafilatura.extract(
+              content_bytes.decode("utf-8", errors="ignore"), output_format="markdown"
+          )
+          return [extracted_text if extracted_text is not None else ""]
+      except Exception as e:
+          return [f"Error processing HTML: {str(e)}"]
+  ```
+  - Uses `trafilatura` to extract the main content from HTML and convert it to Markdown.
+
+### 4. PDF Processing Strategy Integration
+For PDF files, `_process_file_content` delegates to a specific strategy based on `pdf_backend_choice`. This choice is determined by the `PDF_BACKEND` environment variable (see `llm_food/config.py`). The actual implementation of these strategies is covered in more detail in [PDFProcessingStrategy (Synchronous)](pdfprocessingstrategy__synchronous_.mdc).
+
+```python
+# llm_food/app.py (within _process_file_content for ext == ".pdf")
+if pdf_backend_choice == "pymupdf4llm":
+    texts_list = await asyncio.to_thread(_process_pdf_pymupdf4llm_sync, content)
+elif pdf_backend_choice == "pypdf2":
+    texts_list = await asyncio.to_thread(_process_pdf_pypdf2_sync, content)
+elif pdf_backend_choice == "gemini":
+    # Gemini strategy (async, involves API calls)
+    pages = convert_from_bytes(content) # pdf2image
+    # ... (prepare image data for Gemini) ...
+    # ... (make async calls to Gemini API using client.aio.models.generate_content) ...
+    # texts_list = [result.text for result in results]
+    # (Simplified - see app.py for full Gemini logic)
+else:
+    texts_list = ["Invalid PDF backend specified."]
+```
+- **`pymupdf4llm` and `pypdf2`:** These use synchronous libraries, so their respective helper functions (`_process_pdf_pymupdf4llm_sync`, `_process_pdf_pypdf2_sync`) are called via `asyncio.to_thread`.
+  ```python
+  # llm_food/app.py
+  def _process_pdf_pymupdf4llm_sync(content_bytes: bytes) -> List[str]:
+      try:
+          # pymupdf4llm processes PDF to Markdown page by page
+          pymupdf_doc = pymupdf.Document(stream=content_bytes, filetype="pdf")
+          page_data_list = to_markdown(pymupdf_doc, page_chunks=True)
+          return [page_dict.get("text", "") for page_dict in page_data_list]
+      except Exception as e:
+          return [f"Error processing PDF with pymupdf4llm: {str(e)}"]
+  ```
+- **`gemini`:** This strategy is inherently asynchronous as it involves network calls to the Google Gemini API. The logic uses `pdf2image` to convert PDF pages to images, then makes asynchronous calls to Gemini for OCR and content generation for each page. This part of `_process_file_content` is `async` native.
+
+The output `texts_list` (a list of strings) is then packaged into a `ConversionResponse` model (see [APIDataModels (Pydantic)](apidatamodels__pydantic_.mdc)) by the calling endpoint.
+
+## Reusability and Testability
+
+Although implemented as a collection of functions within `llm_food/app.py`, this "service" logic is designed for reusability.
+- The main `_process_file_content` function can be called from anywhere that needs to convert file content synchronously. For instance, the [BatchJobOrchestrator](batchjoborchestrator.mdc) might use it for converting non-PDF files within a batch job.
+- Each specific processing function (e.g., `_process_docx_sync`) is self-contained for its file type, making it individually testable with known inputs and outputs.
+
+This encapsulation of conversion logic is a key design principle of the `llm-food` project, promoting modularity even within a single application file.
+
+## Conclusion
+
+The `SynchronousConversionService`, primarily embodied by the `_process_file_content` function and its helpers in `llm_food/app.py`, is the workhorse for all on-demand, single-file conversions in `llm-food`. It handles file type detection, dynamic selection of conversion tools (including configurable PDF strategies), and manages the execution of these tools in a way that's compatible with the FastAPI asynchronous environment. Its output is directly used to form the response for the `/convert` API endpoints.
+
+Understanding this service is crucial for comprehending how `llm-food` performs its core task of transforming various document formats into Markdown for immediate consumption.
+
+Next, we will explore how `llm-food` handles more complex, multi-file asynchronous operations with the [BatchJobOrchestrator](batchjoborchestrator.mdc).
+
+
+---
+
+Generated by [Rules for AI](https://github.com/altaidevorg/rules-for-ai)
