@@ -198,3 +198,82 @@ class LLMFoodClient:
             raise LLMFoodClientError(
                 f"Error retrieving detailed batch job status ({task_id}): {str(e)}"
             )
+
+    # --- Text Batch Processing Methods ---
+
+    async def create_text_batch_job(
+        self,
+        file_path: str,
+        job_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Creates a new text batch job by uploading a JSONL file.
+        """
+        endpoint = "/text-batch"
+        file_object = None
+        try:
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"File not found: {file_path}")
+
+            file_name = os.path.basename(file_path)
+            # The server expects the file part to be named 'file'
+            # and the content type should ideally be 'application/jsonl' or 'text/plain'
+            # Forcing 'application/octet-stream' might be too generic but often works.
+            # Let's try 'application/jsonl' first, then fallback or let server decide.
+            file_object = open(file_path, "rb")
+            files_payload = {
+                "file": (file_name, file_object, "application/jsonl")
+            }
+
+            data_payload = {}
+            if job_name:
+                data_payload["job_name"] = job_name
+            
+            # Using self._request to handle headers and error wrapping consistently.
+            # self._request should be able to pass 'files' and 'data' to client.request
+            response = await self._request(
+                "POST", endpoint, files=files_payload, data=data_payload
+            )
+            return response.json()
+
+        except FileNotFoundError as e:
+            raise LLMFoodClientError(str(e))
+        except LLMFoodClientError:  # Re-raise client errors
+            raise
+        except Exception as e:
+            raise LLMFoodClientError(
+                f"Error creating text batch job ({file_path}): {str(e)}"
+            )
+        finally:
+            if file_object and not file_object.closed:
+                file_object.close()
+
+    async def get_text_batch_job_status(self, job_id: str) -> Dict[str, Any]:
+        """
+        Retrieves the status of a specific text batch job.
+        """
+        endpoint = f"/text-batch/{job_id}/status"
+        try:
+            response = await self._request("GET", endpoint)
+            return response.json()
+        except LLMFoodClientError:  # Re-raise client errors
+            raise
+        except Exception as e:
+            raise LLMFoodClientError(
+                f"Error retrieving text batch job status ({job_id}): {str(e)}"
+            )
+
+    async def get_text_batch_job_results(self, job_id: str) -> Dict[str, Any]:
+        """
+        Retrieves the results of a specific text batch job.
+        """
+        endpoint = f"/text-batch/{job_id}/results"
+        try:
+            response = await self._request("GET", endpoint)
+            return response.json()
+        except LLMFoodClientError:  # Re-raise client errors
+            raise
+        except Exception as e:
+            raise LLMFoodClientError(
+                f"Error retrieving text batch job results ({job_id}): {str(e)}"
+            )

@@ -53,7 +53,18 @@ from .models import (
     BatchOutputItem,
     ConversionResponse,
     BatchJobStatusResponse,
+    # Text Batch Models
+    TextBatchTaskItemInput,
+    TextBatchJobCreateRequest, # Though request comes as form data + file
+    TextBatchJobCreateResponse,
+    TextBatchJobStatusResponse,
+    TextBatchJobResultsResponse,
+    TextBatchJobStatus,
+    TextBatchIndividualTaskStatusInfo,
+    TextBatchJobResultItem,
+    ChatMessageInput, # Used in TextBatchTaskItemInput
 )
+from pydantic import ValidationError
 
 # --- Conditional imports based on the PDF backend ---
 match get_pdf_backend():
@@ -181,6 +192,34 @@ def initialize_db_schema():
                 error_message VARCHAR,
                 created_at TIMESTAMP NOT NULL,
                 updated_at TIMESTAMP
+            )
+        """)
+
+        # New tables for text batch processing
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS text_batch_jobs (
+                job_id VARCHAR PRIMARY KEY,
+                job_name VARCHAR,
+                status VARCHAR NOT NULL,
+                submitted_at TIMESTAMP NOT NULL,
+                last_updated_at TIMESTAMP NOT NULL,
+                total_tasks INTEGER DEFAULT 0,
+                processed_tasks INTEGER DEFAULT 0,
+                failed_tasks INTEGER DEFAULT 0
+            )
+        """)
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS text_batch_job_tasks (
+                task_id VARCHAR PRIMARY KEY,
+                job_id VARCHAR NOT NULL REFERENCES text_batch_jobs(job_id),
+                system_instruction TEXT,
+                history_json TEXT, -- Store the list of ChatMessageInput as JSON string
+                status VARCHAR NOT NULL, -- e.g., "pending", "processing", "completed", "failed"
+                generated_text TEXT,
+                error_message TEXT,
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP NOT NULL
             )
         """)
     finally:
@@ -1235,3 +1274,329 @@ def main():
 if __name__ == "__main__":
     # This allows running the FastAPI app directly using `python -m llm_food.app`
     main()
+
+
+# --- Text Batch Processing Endpoints ---
+
+@app.post(
+    "/text-batch",
+    response_model=TextBatchJobCreateResponse,
+    dependencies=[Depends(authenticate_request)],
+    tags=["Text Batch Processing"],
+)
+async def create_text_batch_job(
+    file: UploadFile = File(...),
+    job_name: Optional[str] = Form(None),
+    background_tasks: BackgroundTasks = Depends(), # Added BackgroundTasks
+):
+    job_id = str(uuid.uuid4())
+    current_time = datetime.utcnow()
+    tasks_to_insert = []
+    total_tasks = 0
+
+    try:
+        content_bytes = await file.read()
+        content_str = content_bytes.decode('utf-8')
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error reading or decoding file: {str(e)}")
+    finally:
+        await file.close()
+
+    lines = content_str.splitlines()
+    if not lines:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty or not in expected JSONL format.")
+
+    for i, line in enumerate(lines):
+        if not line.strip(): # Skip empty lines
+            continue
+        try:
+            task_data_json = json.loads(line)
+            task_input = TextBatchTaskItemInput(**task_data_json)
+
+            task_id = task_input.task_id or str(uuid.uuid4()) # Use client provided or generate new
+            # Ensure task_id uniqueness within this job could be added here if necessary,
+            # but for now relying on UUIDs or client's good behavior.
+
+            history_json = json.dumps([msg.model_dump() for msg in task_input.history])
+
+            tasks_to_insert.append((
+                task_id,
+                job_id,
+                task_input.system_instruction,
+                history_json,
+                "pending", # Initial status
+                current_time, # created_at
+                current_time, # updated_at
+            ))
+            total_tasks += 1
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON in line {i+1}: {line}")
+        except ValidationError as e:
+            raise HTTPException(status_code=400, detail=f"Validation error in line {i+1}: {e.errors()}")
+        except Exception as e: # Catch any other unexpected error during task processing
+            raise HTTPException(status_code=500, detail=f"Unexpected error processing line {i+1}: {str(e)}")
+
+    if not tasks_to_insert:
+        raise HTTPException(status_code=400, detail="No valid task items found in the uploaded file.")
+
+    con = get_db_connection()
+    try:
+        con.begin()
+        con.execute(
+            "INSERT INTO text_batch_jobs (job_id, job_name, status, submitted_at, last_updated_at, total_tasks) VALUES (?, ?, ?, ?, ?, ?)",
+            (job_id, job_name, TextBatchJobStatus.PENDING.value, current_time, current_time, total_tasks)
+        )
+        con.executemany(
+            "INSERT INTO text_batch_job_tasks (task_id, job_id, system_instruction, history_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            tasks_to_insert
+        )
+        con.commit()
+    except Exception as e:
+        con.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    finally:
+        con.close()
+
+    # Enqueue the background task
+    background_tasks.add_task(_process_text_batch_job, job_id=job_id)
+
+    return TextBatchJobCreateResponse(job_id=job_id, message="Text batch job created successfully and processing started in background.")
+
+
+@app.get(
+    "/text-batch/{job_id}/status",
+    response_model=TextBatchJobStatusResponse,
+    dependencies=[Depends(authenticate_request)],
+    tags=["Text Batch Processing"],
+)
+async def get_text_batch_job_status(job_id: str):
+    con = get_db_connection()
+    try:
+        job_row = con.execute(
+            "SELECT job_id, job_name, status, submitted_at, last_updated_at, total_tasks, processed_tasks, failed_tasks FROM text_batch_jobs WHERE job_id = ?",
+            (job_id,)
+        ).fetchone()
+
+        if not job_row:
+            raise HTTPException(status_code=404, detail=f"Text batch job with ID {job_id} not found.")
+
+        job_details = dict(zip([desc[0] for desc in con.description], job_row))
+
+        task_rows = con.execute(
+            "SELECT task_id, status, error_message FROM text_batch_job_tasks WHERE job_id = ?",
+            (job_id,)
+        ).fetchall()
+
+        tasks_status_info = [
+            TextBatchIndividualTaskStatusInfo(task_id=row[0], status=row[1], error=row[2])
+            for row in task_rows
+        ]
+        job_details["tasks"] = tasks_status_info
+        # Pydantic will validate the model
+        return TextBatchJobStatusResponse(**job_details)
+    except HTTPException:
+        raise # Re-raise HTTPExceptions directly
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving job status: {str(e)}")
+    finally:
+        con.close()
+
+
+async def _process_text_batch_job(job_id: str):
+    """
+    Background task to process a text batch job.
+    Simulates LLM interaction for each task.
+    """
+    print(f"Starting background processing for text batch job: {job_id}")
+    con = get_db_connection()
+    try:
+        # Initial update: Mark job as processing (if not already)
+        # This might be redundant if create_text_batch_job already sets to PENDING and this is the first processor.
+        # However, it's good practice if multiple workers/restarts could occur.
+        con.execute(
+            "UPDATE text_batch_jobs SET status = ?, last_updated_at = ? WHERE job_id = ? AND status = ?",
+            (TextBatchJobStatus.PROCESSING.value, datetime.utcnow(), job_id, TextBatchJobStatus.PENDING.value)
+        )
+        con.commit()
+
+        pending_tasks_rows = con.execute(
+            "SELECT task_id, system_instruction, history_json FROM text_batch_job_tasks WHERE job_id = ? AND status = ?",
+            (job_id, "pending")
+        ).fetchall()
+
+        tasks_processed_count = 0
+        tasks_failed_count = 0
+
+        for task_row_tuple in pending_tasks_rows:
+            task_id, system_instruction, history_json_str = task_row_tuple
+            current_task_processed = False
+            current_task_error_message = None
+            generated_text_output = None
+            task_updated_at = datetime.utcnow()
+
+            try:
+                # 1. Update task to "processing"
+                con.execute(
+                    "UPDATE text_batch_job_tasks SET status = ?, updated_at = ? WHERE task_id = ?",
+                    ("processing", task_updated_at, task_id)
+                )
+                con.execute("UPDATE text_batch_jobs SET last_updated_at = ? WHERE job_id = ?", (task_updated_at, job_id))
+                con.commit()
+
+                # 2. Simulate LLM call & work
+                await asyncio.sleep(1) # Simulate async work
+
+                history_data = json.loads(history_json_str) if history_json_str else []
+                
+                if not history_data: # Example error condition
+                    current_task_error_message = "Input history is empty. Cannot process."
+                    raise ValueError(current_task_error_message)
+
+                last_user_message = ""
+                if history_data and isinstance(history_data, list) and len(history_data) > 0:
+                    # Assuming history is list of dicts with 'role' and 'content'
+                    for msg in reversed(history_data):
+                        if msg.get("role") == "user":
+                            last_user_message = msg.get("content", "")
+                            break
+                
+                if system_instruction and "translate to french" in system_instruction.lower():
+                    generated_text_output = f"Bonjour (simulated translation of: {last_user_message})"
+                elif system_instruction:
+                    generated_text_output = f"Processed with instruction '{system_instruction}': {last_user_message} (simulated)"
+                else:
+                    generated_text_output = f"Processed: {last_user_message} (simulated)"
+                
+                current_task_processed = True
+
+            except Exception as e:
+                current_task_error_message = current_task_error_message or str(e)
+                print(f"Error processing task {task_id} for job {job_id}: {current_task_error_message}")
+            
+            # 3. Update task result
+            task_final_status = "completed" if current_task_processed else "failed"
+            con.execute(
+                "UPDATE text_batch_job_tasks SET status = ?, generated_text = ?, error_message = ?, updated_at = ? WHERE task_id = ?",
+                (task_final_status, generated_text_output, current_task_error_message, datetime.utcnow(), task_id)
+            )
+
+            if current_task_processed:
+                tasks_processed_count += 1
+                con.execute(
+                    "UPDATE text_batch_jobs SET processed_tasks = processed_tasks + 1, last_updated_at = ? WHERE job_id = ?",
+                    (datetime.utcnow(), job_id)
+                )
+            else:
+                tasks_failed_count += 1
+                con.execute(
+                    "UPDATE text_batch_jobs SET failed_tasks = failed_tasks + 1, last_updated_at = ? WHERE job_id = ?",
+                    (datetime.utcnow(), job_id)
+                )
+            con.commit()
+
+        # 4. Update final job status
+        job_info = con.execute("SELECT total_tasks FROM text_batch_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        total_tasks_for_job = job_info[0] if job_info else 0
+
+        final_job_status = ""
+        if tasks_failed_count > 0 and tasks_processed_count > 0:
+            final_job_status = TextBatchJobStatus.COMPLETED_WITH_ERRORS.value
+        elif tasks_failed_count > 0 and tasks_processed_count == 0:
+            final_job_status = TextBatchJobStatus.FAILED.value
+        elif tasks_failed_count == 0 and tasks_processed_count == total_tasks_for_job : # All tasks completed successfully
+             final_job_status = TextBatchJobStatus.COMPLETED.value
+        elif tasks_failed_count == 0 and tasks_processed_count < total_tasks_for_job and tasks_processed_count > 0 : # Some tasks were processed, none failed, but not all were picked up? Should not happen with current logic if all pending tasks are fetched.
+            final_job_status = TextBatchJobStatus.COMPLETED_WITH_ERRORS.value # Or a custom status
+            print(f"Warning: Job {job_id} has {tasks_processed_count} processed and {total_tasks_for_job} total. Marking as completed_with_errors.")
+        elif tasks_processed_count == 0 and tasks_failed_count == 0 and total_tasks_for_job > 0: # No tasks processed or failed, but there were tasks
+            final_job_status = TextBatchJobStatus.FAILED.value # Or some other status indicating processing didn't run
+            print(f"Warning: Job {job_id} had tasks but none were processed or failed. Marking as FAILED.")
+        else: # No tasks for the job, or some other edge case
+            final_job_status = TextBatchJobStatus.COMPLETED.value # Default to completed if no tasks / no errors
+
+        con.execute(
+            "UPDATE text_batch_jobs SET status = ?, last_updated_at = ? WHERE job_id = ?",
+            (final_job_status, datetime.utcnow(), job_id)
+        )
+        con.commit()
+        print(f"Finished background processing for text batch job: {job_id}. Final status: {final_job_status}")
+
+    except Exception as e:
+        print(f"Critical error in _process_text_batch_job for job_id {job_id}: {e}")
+        # Attempt to mark the job as failed if a critical error occurs outside the loop
+        try:
+            con.execute(
+                "UPDATE text_batch_jobs SET status = ?, last_updated_at = ? WHERE job_id = ?",
+                (TextBatchJobStatus.FAILED.value, datetime.utcnow(), job_id)
+            )
+            con.commit()
+        except Exception as db_err:
+            print(f"Failed to update job status to FAILED for job_id {job_id} after critical error: {db_err}")
+    finally:
+        if con:
+            con.close()
+
+
+@app.get(
+    "/text-batch/{job_id}/results",
+    response_model=TextBatchJobResultsResponse,
+    dependencies=[Depends(authenticate_request)],
+    tags=["Text Batch Processing"],
+)
+async def get_text_batch_job_results(job_id: str):
+    con = get_db_connection()
+    try:
+        job_status_row = con.execute("SELECT status FROM text_batch_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        if not job_status_row:
+            raise HTTPException(status_code=404, detail=f"Text batch job with ID {job_id} not found.")
+        job_status = TextBatchJobStatus(job_status_row[0]) # Validate status enum
+
+        results_list = []
+        task_rows = con.execute(
+            "SELECT task_id, system_instruction, history_json, status, generated_text, error_message FROM text_batch_job_tasks WHERE job_id = ?",
+            (job_id,)
+        ).fetchall()
+
+        for row_tuple in task_rows:
+            row = dict(zip([desc[0] for desc in con.description], row_tuple))
+            try:
+                history_obj = json.loads(row["history_json"]) if row["history_json"] else []
+                # Ensure history items are ChatMessageInput compatible
+                parsed_history = [ChatMessageInput(**item) for item in history_obj]
+
+                original_input = TextBatchTaskItemInput(
+                    task_id=row["task_id"], # task_id from task row is the original client-provided or generated one
+                    system_instruction=row["system_instruction"],
+                    history=parsed_history
+                )
+                results_list.append(TextBatchJobResultItem(
+                    task_id=row["task_id"],
+                    original_input=original_input,
+                    generated_text=row["generated_text"],
+                    error=row["error_message"],
+                    status=row["status"]
+                ))
+            except Exception as e: # Catch issues with parsing history or model validation
+                # Log this error, maybe append a special error item to results_list
+                print(f"Error processing task {row['task_id']} for results: {str(e)}")
+                # Optionally, create a result item indicating this internal error for this task
+                original_input_partial = TextBatchTaskItemInput(
+                    task_id=row["task_id"],
+                    system_instruction=row["system_instruction"],
+                    history=[] # Cannot parse history
+                )
+                results_list.append(TextBatchJobResultItem(
+                    task_id=row["task_id"],
+                    original_input=original_input_partial,
+                    status="failed_result_parsing",
+                    error=f"Internal error retrieving/parsing task result: {str(e)}"
+                ))
+
+
+        return TextBatchJobResultsResponse(job_id=job_id, status=job_status, results=results_list)
+    except HTTPException:
+        raise # Re-raise HTTPExceptions directly
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving job results: {str(e)}")
+    finally:
+        con.close()
