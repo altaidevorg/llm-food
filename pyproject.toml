@@ -32,12 +32,14 @@ repository = "https://github.com/altaidevorg/llm-food"
 
 [project.optional-dependencies]
 server = [
+    "chonkie",
     "duckdb",
     "fastapi",
     "google-genai",
     "google-cloud-storage",
     "mammoth",
     "markdownify",
+    "pdf-oxide",
     "pdf2image",
     "pypdf2",
     "python-multipart",

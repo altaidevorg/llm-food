@@ -1,12 +1,7 @@
+"""Configuration and environment variables"""
+
 import os
 from typing import Optional, Union
-
-
-def get_pdf_backend():
-    return os.getenv("PDF_BACKEND", "gemini")
-
-
-"""Configuration and environment variables"""
 
 DEFAULT_GEMINI_OCR_PROMPT = """OCR this document to Markdown with text formatting such as bold, italic, headings, tables, numbered and bulleted lists properly rendered in Markdown.
 
@@ -50,6 +45,29 @@ def get_max_file_size_bytes() -> Union[int, None]:
 
 
 SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".rtf", ".pptx", ".html", ".htm"]
+
+
+def get_pdf_backend():
+    return os.getenv("PDF_BACKEND", "auto")
+
+
+# --- PDF Text-vs-Scanned Detection ---
+
+def get_pdf_sample_min() -> int:
+    return int(os.getenv("PDF_SAMPLE_MIN", "2"))
+
+
+def get_pdf_sample_max() -> int:
+    return int(os.getenv("PDF_SAMPLE_MAX", "20"))
+
+
+def get_pdf_word_threshold() -> int:
+    return int(os.getenv("PDF_WORD_THRESHOLD", "75"))
+
+
+def get_pdf_text_ratio() -> float:
+    return float(os.getenv("PDF_TEXT_RATIO", "0.7"))
+
 
 # --- DuckDB Setup ---
 DUCKDB_FILE = os.getenv("DUCKDB_FILE", "batch_tasks.duckdb")

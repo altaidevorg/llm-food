@@ -1,8 +1,8 @@
 """Pydantic models"""
 
 from datetime import datetime
-from typing import Union, List, Optional
-from pydantic import BaseModel
+from typing import Literal, Union, List, Optional
+from pydantic import BaseModel, Field, model_validator
 
 
 class ConversionResponse(BaseModel):
@@ -14,6 +14,29 @@ class ConversionResponse(BaseModel):
 class BatchRequest(BaseModel):
     input_paths: Union[str, List[str]]
     output_path: str
+
+
+class ChunkRequest(BaseModel):
+    text: str
+    strategy: Literal["token", "sentence", "recursive"] = "token"
+    chunk_size: int = Field(default=512, gt=0)
+    chunk_overlap: int = Field(default=128, ge=0)
+
+    @model_validator(mode="after")
+    def validate_overlap_smaller_than_size(self):
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError(
+                f"chunk_overlap ({self.chunk_overlap}) must be less than chunk_size ({self.chunk_size})"
+            )
+        return self
+
+
+class ChunkResponse(BaseModel):
+    chunks: List[str]
+    total_chunks: int
+    strategy: str
+    chunk_size: int
+    chunk_overlap: int
 
 
 # Pydantic models for GET /batch/{task_id} response
