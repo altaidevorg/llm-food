@@ -7,6 +7,8 @@ import os
 
 # Assuming models.py is in the same package and accessible
 from .models import (
+    ChunkRequest,
+    ChunkResponse,
     ConversionResponse,
     BatchJobOutputResponse,
     BatchJobStatusResponse,
@@ -198,3 +200,26 @@ class LLMFoodClient:
             raise LLMFoodClientError(
                 f"Error retrieving detailed batch job status ({task_id}): {str(e)}"
             )
+
+    async def chunk_text(
+        self,
+        text: str,
+        strategy: str = "token",
+        chunk_size: int = 512,
+        chunk_overlap: int = 128,
+    ) -> ChunkResponse:
+        """Chunks text using the /chunk endpoint."""
+        endpoint = "/chunk"
+        payload = ChunkRequest(
+            text=text,
+            strategy=strategy,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        ).model_dump()
+        try:
+            response = await self._request("POST", endpoint, json=payload)
+            return ChunkResponse(**response.json())
+        except LLMFoodClientError:
+            raise
+        except Exception as e:
+            raise LLMFoodClientError(f"Error chunking text: {str(e)}")

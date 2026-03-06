@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import contextlib
+import logging
 import shutil
 import tempfile
 
@@ -10,6 +12,7 @@ from io import BytesIO
 import os
 from typing import List, Optional, Dict
 import uuid
+
 from fastapi import (
     FastAPI,
     UploadFile,
@@ -51,25 +54,37 @@ from .models import (
     BatchJobFailedFileOutput,
     BatchJobOutputResponse,
     BatchOutputItem,
+    ChunkRequest,
+    ChunkResponse,
     ConversionResponse,
     BatchJobStatusResponse,
 )
 
+from chonkie import TokenChunker, SentenceChunker, RecursiveChunker
+
+from pdf2image import convert_from_bytes
+from google import genai
+from google.genai.types import CreateBatchJobConfig, JobState
+
+OCR_PROMPT = get_gemini_prompt()
+
 # --- Conditional imports based on the PDF backend ---
 match get_pdf_backend():
+    case "auto":
+        from .pdf_utils import is_text_based_pdf, extract_markdown_with_pdf_oxide
+    case "pdf_oxide":
+        from .pdf_utils import extract_markdown_with_pdf_oxide
     case "pymupdf4llm":
         from pymupdf4llm import to_markdown
         import pymupdf
     case "pypdf2":
         from pypdf import PdfReader
     case "gemini":
-        from pdf2image import convert_from_bytes
-        from google import genai
-        from google.genai.types import CreateBatchJobConfig, JobState
-
-        OCR_PROMPT = get_gemini_prompt()
+        pass
     case invalid_backend:
         raise ValueError(f"Invalid PDF backend: {invalid_backend}")
+
+logger = logging.getLogger(__name__)
 
 # --- Main application setup ---
 app = FastAPI(
@@ -255,54 +270,107 @@ def _process_pdf_pypdf2_sync(content_bytes: bytes) -> List[str]:
         return [f"Error processing PDF with pypdf: {str(e)}"]
 
 
+@contextlib.contextmanager
+def _temp_pdf(content: bytes):
+    """Write *content* to a temporary PDF and yield the path, cleaning up afterwards."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    tmp.write(content)
+    tmp.close()
+    try:
+        yield tmp.name
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+async def _ocr_pdf_with_gemini(content: bytes) -> List[str]:
+    """Convert a scanned PDF to Markdown via Gemini vision OCR."""
+    try:
+        pages = convert_from_bytes(content)
+    except Exception as e:
+        logger.error("Failed to convert PDF to images: %s", e, exc_info=True)
+        return [f"Error converting PDF to images: {str(e)}"]
+
+    images_b64 = []
+    for page in pages:
+        buffer = BytesIO()
+        page.save(buffer, format="PNG")
+        b64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        images_b64.append(b64_str)
+
+    client = get_gemini_client()
+    payloads = [
+        [
+            {"inline_data": {"data": b64_str, "mime_type": "image/png"}},
+            {"text": OCR_PROMPT},
+        ]
+        for b64_str in images_b64
+    ]
+    try:
+        results = await asyncio.gather(
+            *[
+                client.aio.models.generate_content(
+                    model=GEMINI_MODEL_FOR_VISION, contents=payload
+                )
+                for payload in payloads
+            ]
+        )
+    except Exception as e:
+        logger.error("Gemini OCR request failed: %s", e, exc_info=True)
+        return [f"Error during Gemini OCR: {str(e)}"]
+
+    return [result.text for result in results]
+
+
+async def _process_pdf_content(content: bytes) -> List[str]:
+    """Auto-detect text-based vs scanned PDF and route accordingly.
+
+    Text-based  -> pdf_oxide (fast, local)
+    Scanned     -> Gemini OCR (cloud)
+    """
+    with _temp_pdf(content) as path:
+        try:
+            is_text = await asyncio.to_thread(is_text_based_pdf, path)
+        except Exception:
+            logger.warning("pdf_oxide detection failed, falling back to Gemini OCR", exc_info=True)
+            is_text = False
+
+        if is_text:
+            logger.info("PDF classified as text-based, using pdf_oxide")
+            return await asyncio.to_thread(extract_markdown_with_pdf_oxide, path)
+
+        logger.info("PDF classified as scanned, routing to Gemini OCR")
+        return await _ocr_pdf_with_gemini(content)
+
+
 async def _process_file_content(
     ext: str, content: bytes, pdf_backend_choice: str
 ) -> List[str]:
-    texts_list: List[str] = []
     if ext == ".pdf":
-        if pdf_backend_choice == "pymupdf4llm":
-            texts_list = await asyncio.to_thread(_process_pdf_pymupdf4llm_sync, content)
+        if pdf_backend_choice == "auto":
+            return await _process_pdf_content(content)
+        elif pdf_backend_choice == "pdf_oxide":
+            with _temp_pdf(content) as path:
+                return await asyncio.to_thread(extract_markdown_with_pdf_oxide, path)
+        elif pdf_backend_choice == "pymupdf4llm":
+            return await asyncio.to_thread(_process_pdf_pymupdf4llm_sync, content)
         elif pdf_backend_choice == "pypdf2":
-            texts_list = await asyncio.to_thread(_process_pdf_pypdf2_sync, content)
+            return await asyncio.to_thread(_process_pdf_pypdf2_sync, content)
         elif pdf_backend_choice == "gemini":
-            pages = convert_from_bytes(content)
-            images_b64 = []
-            for page in pages:
-                buffer = BytesIO()
-                page.save(buffer, format="PNG")
-                image_data = buffer.getvalue()
-                b64_str = base64.b64encode(image_data).decode("utf-8")
-                images_b64.append(b64_str)
-            client = get_gemini_client()
-            payloads = [
-                [
-                    {"inline_data": {"data": b64_str, "mime_type": "image/png"}},
-                    {"text": OCR_PROMPT},
-                ]
-                for b64_str in images_b64
-            ]
-            results = await asyncio.gather(
-                *[
-                    client.aio.models.generate_content(
-                        model=GEMINI_MODEL_FOR_VISION, contents=payload
-                    )
-                    for payload in payloads
-                ]
-            )
-            texts_list = [result.text for result in results]
+            return await _ocr_pdf_with_gemini(content)
         else:
-            texts_list = ["Invalid PDF backend specified."]
+            return ["Invalid PDF backend specified."]
     elif ext in [".docx"]:
-        texts_list = await asyncio.to_thread(_process_docx_sync, content)
+        return await asyncio.to_thread(_process_docx_sync, content)
     elif ext in [".rtf"]:
-        texts_list = await asyncio.to_thread(_process_rtf_sync, content)
+        return await asyncio.to_thread(_process_rtf_sync, content)
     elif ext in [".pptx"]:
-        texts_list = await asyncio.to_thread(_process_pptx_sync, content)
+        return await asyncio.to_thread(_process_pptx_sync, content)
     elif ext in [".html", ".htm"]:
-        texts_list = await asyncio.to_thread(_process_html_sync, content)
-    else:
-        texts_list = ["Unsupported file type encountered in _process_file_content."]
-    return texts_list
+        return await asyncio.to_thread(_process_html_sync, content)
+    return ["Unsupported file type encountered in _process_file_content."]
 
 
 @app.post(
@@ -322,13 +390,11 @@ async def convert_file_upload(file: UploadFile = File(...)):
         )
 
     content_hash = hashlib.sha256(content).hexdigest()
-    pdf_backend_choice = get_pdf_backend()
 
-    texts_list = await _process_file_content(ext, content, pdf_backend_choice)
+    texts_list = await _process_file_content(ext, content, get_pdf_backend())
 
     if texts_list and (
         texts_list[0].startswith("Error processing")
-        or texts_list[0].startswith("Invalid PDF backend")
         or texts_list[0].startswith("Unsupported file type")
     ):
         raise HTTPException(status_code=400, detail=texts_list[0])
@@ -372,6 +438,40 @@ async def convert_url(
 
     return ConversionResponse(
         filename=filename, content_hash=content_hash, texts=texts_list
+    )
+
+
+@app.post(
+    "/chunk",
+    response_model=ChunkResponse,
+    dependencies=[Depends(authenticate_request)],
+)
+async def chunk_text(request: ChunkRequest):
+    chunker_classes = {
+        "token": TokenChunker,
+        "sentence": SentenceChunker,
+        "recursive": RecursiveChunker,
+    }
+    chunker_cls = chunker_classes[request.strategy]
+    kwargs = {"chunk_size": request.chunk_size}
+    if request.strategy != "recursive":
+        kwargs["chunk_overlap"] = request.chunk_overlap
+    try:
+        chunker = chunker_cls(**kwargs)
+        chunks = await asyncio.to_thread(chunker.chunk, request.text)
+    except Exception as e:
+        logger.error("Chunking failed with strategy=%s: %s", request.strategy, e, exc_info=True)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chunking failed ({request.strategy}): {e}",
+        )
+    chunk_texts = [c.text for c in chunks]
+    return ChunkResponse(
+        chunks=chunk_texts,
+        total_chunks=len(chunk_texts),
+        strategy=request.strategy,
+        chunk_size=request.chunk_size,
+        chunk_overlap=request.chunk_overlap,
     )
 
 
@@ -445,8 +545,9 @@ def batch_files_upload(
         )
 
     temp_files = []  # Keep track of temp files for cleanup in case of errors
+    pdf_backend = get_pdf_backend()
     try:
-        print("Processing uploaded files...")
+        logger.info("Processing uploaded files...")
         for f in files:
             ext = os.path.splitext(f.filename)[1].lower()
 
@@ -459,8 +560,29 @@ def batch_files_upload(
             temp_file.close()  # Close but don't delete (delete=False above)
 
             if ext == ".pdf":
-                pdf_files_data_for_batch.append((f.filename, temp_file.name))
-            elif ext in SUPPORTED_EXTENSIONS:  # Excludes .pdf as it's handled above
+                if pdf_backend == "auto":
+                    try:
+                        text_based = is_text_based_pdf(temp_file.name)
+                    except Exception:
+                        logger.warning(
+                            "pdf_oxide detection failed for %s, routing to Gemini batch",
+                            f.filename,
+                            exc_info=True,
+                        )
+                        text_based = False
+                    if text_based:
+                        non_pdf_files_for_individual_processing.append(
+                            (f.filename, ext, temp_file.name)
+                        )
+                    else:
+                        pdf_files_data_for_batch.append((f.filename, temp_file.name))
+                elif pdf_backend in ("pdf_oxide", "pymupdf4llm", "pypdf2"):
+                    non_pdf_files_for_individual_processing.append(
+                        (f.filename, ext, temp_file.name)
+                    )
+                else:
+                    pdf_files_data_for_batch.append((f.filename, temp_file.name))
+            elif ext in SUPPORTED_EXTENSIONS:
                 non_pdf_files_for_individual_processing.append(
                     (f.filename, ext, temp_file.name)
                 )
@@ -719,7 +841,6 @@ async def _process_single_non_pdf_file_and_upload(
         with open(temp_file_path, "rb") as f:
             content_bytes = f.read()
 
-        # Re-use the existing _process_file_content logic
         markdown_texts = await _process_file_content(
             file_ext, content_bytes, get_pdf_backend()
         )
