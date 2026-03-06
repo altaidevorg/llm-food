@@ -547,7 +547,7 @@ def batch_files_upload(
     temp_files = []  # Keep track of temp files for cleanup in case of errors
     pdf_backend = get_pdf_backend()
     try:
-        print("Processing uploaded files...")
+        logger.info("Processing uploaded files...")
         for f in files:
             ext = os.path.splitext(f.filename)[1].lower()
 
