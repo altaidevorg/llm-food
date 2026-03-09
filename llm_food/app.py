@@ -28,6 +28,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import httpx
 import mammoth
 import duckdb
+from pydantic import ValidationError
 
 # Imports for GCS
 from google.cloud import storage
@@ -54,8 +55,13 @@ from .models import (
     BatchJobFailedFileOutput,
     BatchJobOutputResponse,
     BatchOutputItem,
+    ChunkParams,
     ChunkRequest,
     ChunkResponse,
+    ChunkStrategy,
+    DEFAULT_CHUNK_OVERLAP,
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_CHUNK_STRATEGY,
     ConversionResponse,
     BatchJobStatusResponse,
 )
@@ -373,32 +379,82 @@ async def _process_file_content(
     return ["Unsupported file type encountered in _process_file_content."]
 
 
-@app.post(
-    "/convert",
-    response_model=ConversionResponse,
-    dependencies=[Depends(authenticate_request)],
-)
-async def convert_file_upload(file: UploadFile = File(...)):
+async def _read_and_validate_upload(file: UploadFile) -> tuple[str, bytes]:
+    """Read uploaded file, validate size, return (extension, content)."""
     ext = os.path.splitext(file.filename)[1].lower()
     content = await file.read()
-
     max_size = get_max_file_size_bytes()
     if max_size is not None and len(content) > max_size:
         raise HTTPException(
             status_code=413,
             detail=f"File size {len(content) / (1024 * 1024):.2f}MB exceeds maximum allowed size of {max_size / (1024 * 1024):.2f}MB.",
         )
+    return ext, content
 
-    content_hash = hashlib.sha256(content).hexdigest()
 
+async def _convert_to_texts(ext: str, content: bytes) -> List[str]:
+    """Convert file content to text list, raising on errors."""
     texts_list = await _process_file_content(ext, content, get_pdf_backend())
-
     if texts_list and (
         texts_list[0].startswith("Error processing")
         or texts_list[0].startswith("Unsupported file type")
     ):
         raise HTTPException(status_code=400, detail=texts_list[0])
+    return texts_list
 
+
+async def _run_chunker(
+    text: str,
+    strategy: ChunkStrategy,
+    chunk_size: int,
+    chunk_overlap: int,
+) -> List[str]:
+    """Initialise the requested chunker and return chunk texts."""
+    chunker_classes = {
+        "token": TokenChunker,
+        "sentence": SentenceChunker,
+        "recursive": RecursiveChunker,
+    }
+    kwargs = {"chunk_size": chunk_size}
+    if strategy != "recursive":
+        kwargs["chunk_overlap"] = chunk_overlap
+    try:
+        chunker = chunker_classes[strategy](**kwargs)
+        chunks = await asyncio.to_thread(chunker.chunk, text)
+    except Exception as e:
+        logger.error("Chunking failed with strategy=%s: %s", strategy, e, exc_info=True)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chunking failed for strategy '{strategy}'.",
+        )
+    return [c.text for c in chunks]
+
+
+def get_chunk_params(
+    strategy: ChunkStrategy = Query(default=DEFAULT_CHUNK_STRATEGY),
+    chunk_size: int = Query(default=DEFAULT_CHUNK_SIZE, gt=0),
+    chunk_overlap: int = Query(default=DEFAULT_CHUNK_OVERLAP, ge=0),
+) -> ChunkParams:
+    try:
+        return ChunkParams(
+            strategy=strategy,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+    except ValidationError as exc:
+        error_detail = "; ".join(err.get("msg", "Invalid chunk parameters.") for err in exc.errors())
+        raise HTTPException(status_code=422, detail=error_detail) from exc
+
+
+@app.post(
+    "/convert",
+    response_model=ConversionResponse,
+    dependencies=[Depends(authenticate_request)],
+)
+async def convert_file_upload(file: UploadFile = File(...)):
+    ext, content = await _read_and_validate_upload(file)
+    content_hash = hashlib.sha256(content).hexdigest()
+    texts_list = await _convert_to_texts(ext, content)
     return ConversionResponse(
         filename=file.filename, content_hash=content_hash, texts=texts_list
     )
@@ -447,31 +503,42 @@ async def convert_url(
     dependencies=[Depends(authenticate_request)],
 )
 async def chunk_text(request: ChunkRequest):
-    chunker_classes = {
-        "token": TokenChunker,
-        "sentence": SentenceChunker,
-        "recursive": RecursiveChunker,
-    }
-    chunker_cls = chunker_classes[request.strategy]
-    kwargs = {"chunk_size": request.chunk_size}
-    if request.strategy != "recursive":
-        kwargs["chunk_overlap"] = request.chunk_overlap
-    try:
-        chunker = chunker_cls(**kwargs)
-        chunks = await asyncio.to_thread(chunker.chunk, request.text)
-    except Exception as e:
-        logger.error("Chunking failed with strategy=%s: %s", request.strategy, e, exc_info=True)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Chunking failed ({request.strategy}): {e}",
-        )
-    chunk_texts = [c.text for c in chunks]
+    chunk_texts = await _run_chunker(
+        request.text, request.strategy, request.chunk_size, request.chunk_overlap
+    )
     return ChunkResponse(
         chunks=chunk_texts,
         total_chunks=len(chunk_texts),
         strategy=request.strategy,
         chunk_size=request.chunk_size,
         chunk_overlap=request.chunk_overlap,
+    )
+
+
+@app.post(
+    "/be",
+    response_model=ChunkResponse,
+    dependencies=[Depends(authenticate_request)],
+)
+async def convert_and_chunk(
+    file: UploadFile = File(...),
+    chunk_params: ChunkParams = Depends(get_chunk_params),
+):
+    ext, content = await _read_and_validate_upload(file)
+    texts_list = await _convert_to_texts(ext, content)
+    chunk_texts = await _run_chunker(
+        "\n".join(texts_list),
+        chunk_params.strategy,
+        chunk_params.chunk_size,
+        chunk_params.chunk_overlap,
+    )
+
+    return ChunkResponse(
+        chunks=chunk_texts,
+        total_chunks=len(chunk_texts),
+        strategy=chunk_params.strategy,
+        chunk_size=chunk_params.chunk_size,
+        chunk_overlap=chunk_params.chunk_overlap,
     )
 
 

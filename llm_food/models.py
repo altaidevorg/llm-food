@@ -5,6 +5,12 @@ from typing import Literal, Union, List, Optional
 from pydantic import BaseModel, Field, model_validator
 
 
+ChunkStrategy = Literal["token", "sentence", "recursive"]
+DEFAULT_CHUNK_STRATEGY: ChunkStrategy = "token"
+DEFAULT_CHUNK_SIZE = 512
+DEFAULT_CHUNK_OVERLAP = 128
+
+
 class ConversionResponse(BaseModel):
     filename: str
     content_hash: str
@@ -16,11 +22,10 @@ class BatchRequest(BaseModel):
     output_path: str
 
 
-class ChunkRequest(BaseModel):
-    text: str
-    strategy: Literal["token", "sentence", "recursive"] = "token"
-    chunk_size: int = Field(default=512, gt=0)
-    chunk_overlap: int = Field(default=128, ge=0)
+class ChunkParams(BaseModel):
+    strategy: ChunkStrategy = DEFAULT_CHUNK_STRATEGY
+    chunk_size: int = Field(default=DEFAULT_CHUNK_SIZE, gt=0)
+    chunk_overlap: int = Field(default=DEFAULT_CHUNK_OVERLAP, ge=0)
 
     @model_validator(mode="after")
     def validate_overlap_smaller_than_size(self):
@@ -29,6 +34,10 @@ class ChunkRequest(BaseModel):
                 f"chunk_overlap ({self.chunk_overlap}) must be less than chunk_size ({self.chunk_size})"
             )
         return self
+
+
+class ChunkRequest(ChunkParams):
+    text: str
 
 
 class ChunkResponse(BaseModel):
